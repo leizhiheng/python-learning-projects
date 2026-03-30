@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python)",
+      "Bash(python:*)",
+      "Bash(echo:*)",
+      "Bash(powershell -c \"[Environment]::SetEnvironmentVariable\\('PYTHON_NO_REPL', '1', 'User'\\)\")",
+      "Bash(export PYTHON_NO_REPL=1)",
+      "Bash(chcp 65001)",
+      "Bash(PYTHONUTF8=1 python decorator.py)",
+      "Bash(del \"d:\\\\workspace_android\\\\PythonStudy\\\\asynctest.py\")",
+      "Bash(netstat -ano)",
+      "Bash(findstr :3306)",
+      "Bash(sc query:*)",
+      "Bash(findstr /i mysql)",
+      "Bash(net start:*)",
+      "Bash(sc queryex:*)",
+      "Bash(findstr -i mysql)",
+      "Read(//c/Program Files/**)",
+      "Read(//c/Program Files \\(x86\\)/**)",
+      "Bash(curl -s http://localhost:8080/api/books)",
+      "Bash(curl:*)",
+      "Bash(git init:*)",
+      "Bash(git config:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Read(//c/Users/zhiheng.lei/.ssh/**)",
+      "Bash(gh repo:*)",
+      "Bash(git remote:*)",
+      "Bash(git push:*)",
+      "Bash(ssh-keygen:*)",
+      "Bash(ssh:*)"
+    ]
+  }
+}

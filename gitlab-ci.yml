@@ -1,0 +1,2633 @@
+variables:
+  PCI_VARIANT:
+    value: official
+    description: Indicate building for which variant. Select from `official, stalco`.
+  PCI_BACKEND_ENV:
+    value: PRODUCTION
+    description: Indicate building for which backend environment. Select from `PRODUCTION, PRE_RELEASE, TEST`.
+  PCI_BUILD_TYPE:
+    value: RELEASE
+    description: Indicate the build type. Select from `RELEASE`, `DEBUG`.
+  PCI_AAB:
+    value: "false"
+    description: Indicate whether to build AAB(Android App Bundle). If set to true, the aab file will be built.
+  PCI_IJIAMI_ENCRYPT:
+    value: "false"
+    description: Indicate whether to use ijiami to encrypt the apk/aab(s). If set to true, the apk/aab(s) will be encrypted by ijiami.
+official:
+  stage: build
+  tags:
+    - rosa
+    - linux
+  image:
+    name: rosa/android-sdk:36-20250715
+    entrypoint:
+      - ""
+  variables:
+    GIT_CHECKOUT: "false"
+    GIT_STRATEGY: none
+  script:
+    - |-
+      set -xeo pipefail
+
+      # sourced modules
+      # module: build
+      st_build_semver_regex='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(rc|alpha|beta)\.([1-9][0-9]*)){0,1}'
+
+      st_build_check_semver() {
+        local version=${1:?Missing argument \`\$1 - version\` when calling st_build_check_semver.}
+        if (echo "$version" | grep -Eq "^$st_build_semver_regex$"); then
+          return 0
+        else
+          st_log_error "Illegal semantic version. Should meet this regex: \`^$st_build_semver_regex$\`."
+          return 1
+        fi
+      }
+
+      st_build_check_semver_in_text_file() {
+        local text_file=${1:?Missing argument \`\$1 - text_file\` when calling st_build_check_semver_in_text_file.}
+        local version_line_regex=${2-.*}
+
+        local count
+        let count=$(grep -E "$version_line_regex" "$text_file" | grep -cE "$st_build_semver_regex" || true)
+        if [ $count -eq 1 ]; then
+          return 0
+        fi
+
+        if [ $count -eq 0 ]; then
+          st_log_error "A semantic-version is not found in \`$text_file\`."
+        else
+          st_log_error "Multiple semantic-versions are found in \`$text_file\`."
+        fi
+        return 1
+      }
+
+      st_build_read_semver_from_text_file() {
+        local text_file=${1:?Missing argument \`\$1 - text_file\` when calling st_build_read_semver_from_text_file.}
+        local version_line_regex=${2-.*}
+
+        st_fs_read_string_from_text_file "$text_file" "$st_build_semver_regex" "$version_line_regex"
+      }
+
+      st_build_bump_semver() {
+        local current=${1:?Missing argument \`\$1 - current\` when calling st_build_bump_semver.}
+        local increment_version=${2:?Missing argument \`\$2 - increment_version\` when calling st_build_bump_semver.}
+
+        # PATCH/MINOR/MAJOR
+        local major minor patch
+        let major=$(echo "$current" | awk -F '.' '{print $1}') || :
+        let minor=$(echo "$current" | awk -F '.' '{print $2}') || :
+        let patch=$(echo "$current" | awk -F '.' '{print $3}') || :
+
+        if [ "$increment_version" = "MAJOR" ]; then
+          let major=major+1 || :
+          let minor=0 || :
+          let patch=0 || :
+        elif [ "$increment_version" = "MINOR" ]; then
+          let minor=minor+1 || :
+          let patch=0 || :
+        elif [ "$increment_version" = "PATCH" ]; then
+          let patch=patch+1 || :
+        else
+          st_log_error "Illegal \`current\` version: $current."
+          return 1
+        fi
+
+        echo "$major.$minor.$patch"
+      }
+
+      st_build_prepare_build_numbers_repo() {
+        local repository=${1:?Missing argument \`\$1 - repository\` when calling st_build_prepare_build_numbers_repo.}
+        local branch=${2:?Missing argument \`\$2 - branch\` when calling st_build_prepare_build_numbers_repo.}
+        local directory=${3:?Missing argument \`\$3 - directory\` when calling st_build_prepare_build_numbers_repo.}
+
+        rm -rf "$directory"
+        if (git ls-remote "$repository" | grep -Eq "refs/heads/$branch$"); then
+          git clone -b "$branch" --depth 1 "$repository" "$directory"
+        else
+          git init "$directory"
+          git -C "$directory" remote add origin "$repository"
+
+          touch "$directory/BUILD_NUMBER"
+          git -C "$directory" add -A
+          git -C "$directory" commit -m 'add an empty BUILD_NUMBER file'
+          git -C "$directory" branch -m "$branch"
+        fi
+      }
+
+      st_build_cal_incremental_build_number() {
+        local repo_dir=${1:?Missing argument \`\$1 - repo_dir\` when calling st_build_cal_incremental_build_number.}
+
+        if [ -s "$repo_dir/BUILD_NUMBER" ]; then
+          local current incremental
+          let current=$(cat "$repo_dir/BUILD_NUMBER" | head -n 1) || [ -n "$current" ]
+          if [ $current -le 0 ]; then
+            st_log_error "Illegal build number in \`$repo_dir/BUILD_NUMBER\` which <= 0."
+            return 1
+          fi
+
+          let incremental=current+1
+          echo "$incremental"
+        else
+          echo "1"
+        fi
+      }
+
+      st_build_save_incremental_build_number() {
+        local repo_dir=${1:?Missing argument \`\$1 - repo_dir\` when calling st_build_save_incremental_build_number.}
+
+        local incremental
+        let incremental=$(st_build_cal_incremental_build_number "$repo_dir")
+        echo "$incremental" >"$repo_dir/BUILD_NUMBER"
+
+        git -C "$repo_dir" add 'BUILD_NUMBER'
+        git -C "$repo_dir" commit -m "build-number: $incremental"
+        git -C "$repo_dir" push origin "HEAD:refs/heads/$(git -C "$repo_dir" rev-parse --abbrev-ref HEAD)"
+      }
+
+      st_build_conan_add_or_update_remote() {
+        local remote_name=${1:?Missing argument \`\$1 - remote_name\` when calling st_build_conan_add_or_update_remote.}
+        local remote_url=${2:?Missing argument \`\$2 - remote_url\` when calling st_build_conan_add_or_update_remote.}
+
+        if (echo "$remote_url" | grep -Eq '^http://'); then
+          conan remote add -f "$remote_name" "$remote_url" False
+        else
+          conan remote add -f "$remote_name" "$remote_url"
+        fi
+      }
+
+      st_build_conan_user() {
+        local remote=${1:?Missing argument \`\$1 - remote\` when calling st_build_conan_user.}
+        local name=${2:?Missing argument \`\$2 - name\` when calling st_build_conan_user.}
+
+        # protect `password`
+        local print_commands
+        print_commands=$(if echo "$-" | grep -q 'x'; then echo 'true'; fi)
+        if [ -n "$print_commands" ]; then set +x; fi
+
+        local password=${3:?Missing argument \`\$3 - password\` when calling st_build_conan_user.}
+        conan user "$name" -r "$remote" -p "$password"
+
+        if [ -n "$print_commands" ]; then set -x; fi
+      }
+
+      st_build_conan_install() {
+        local project_dir=${1:-.}
+        local install_dir=${2:-build}
+        local profile_host=${3:-}
+        local other_args=
+        shift 3 2>/dev/null && other_args=$@
+
+        if [ -z "$profile_host" ]; then
+          sh -c "conan install \"$project_dir\" -if \"$install_dir\" $other_args"
+        else
+          sh -c "conan install \"$project_dir\" -if \"$install_dir\" -pr \"$profile_host\" $other_args"
+        fi
+
+        . "$install_dir"/activate.sh
+      }
+
+      st_build_cmake_generate() {
+        local project_dir=${1:-.}
+        local build_dir=${2:-build}
+        local install_dir=${3:-out}
+        local generator=${4:-Unix Makefiles}
+        local build_type=${5:-Debug}
+
+        local install_dir_arg="-DCMAKE_INSTALL_PREFIX=$install_dir"
+        local generator_arg="-G$generator"
+
+        if [ "Unix Makefiles" = "$generator" ]; then
+          cmake -S "$project_dir" -B "$build_dir" "$install_dir_arg" "$generator_arg" "-DCMAKE_BUILD_TYPE=$build_type"
+        else
+          cmake -S "$project_dir" -B "$build_dir" "$install_dir_arg" "$generator_arg"
+        fi
+      }
+
+      st_build_cmake_build() {
+        local build_dir=${1:-build}
+        local build_config=${2:-}
+
+        local job_count=
+        if [ "$(uname)" = 'Darwin' ]; then
+          job_count=$(sysctl -n hw.physicalcpu)
+        else
+          job_count=$(nproc)
+        fi
+
+        if [ -z "$build_config" ]; then
+          cmake --build "$build_dir" -j "$job_count"
+        else
+          cmake --build "$build_dir" -j "$job_count" --config "$build_config"
+        fi
+      }
+
+      st_build_cmake_install() {
+        local build_dir=${1:-build}
+
+        cmake --build "$build_dir" --target install
+      }
+
+      st_build_gradle_add_property() {
+        local name=${1:?Missing argument \`\$1 - name\` when calling st_build_gradle_add_property.}
+        local value=${2:?Missing argument \`\$2 - value\` when calling st_build_gradle_add_property.}
+
+        local gradle_user_home=${GRADLE_USER_HOME:-$HOME/.gradle}
+        mkdir -p "$gradle_user_home"
+
+        local gradle_property_file="$gradle_user_home/gradle.properties"
+        touch "$gradle_property_file"
+
+        if (grep -Eq "$name=" "$gradle_property_file"); then
+          sed -i --follow-symlinks "s/.*$name=.*/$name=$value/g" "$gradle_property_file"
+        else
+          echo "$name=$value" >>"$gradle_property_file"
+        fi
+      }
+
+      st_build_android_gradle_build() {
+        local project_dir=${1:-.}
+        local out_dir=${2:-out}
+        local build_task=${3:-assemble}
+        local gradle_project_dir=${4:-}
+        local gen_mapping_and_symbols=${5:-false}
+
+        gradle_project_dir=$(echo "$gradle_project_dir" | sed -E 's/^(\.$|\.\/+)//g')
+        local gradle_project_dir_rel_to_run_dir="$project_dir$([ -n "$gradle_project_dir" ] && echo "/$gradle_project_dir")"
+        sh "$project_dir/gradlew" --parallel -p "$gradle_project_dir_rel_to_run_dir" "$build_task"
+
+        local file_map=
+        check_same_name() {
+          local generated_file=${1:?Missing argument \`\$1 - generated_file\` when calling check_same_name.}
+          local output_file=${2:?Missing argument \`\$2 - output_file\` when calling check_same_name.}
+
+          echo "$output_file:$generated_file"
+
+          local existing
+          existing=$(echo "$file_map" | (grep -E "^$output_file:" || true) | awk -F ':' '{print $2}')
+          if [ -n "$existing" ]; then
+            st_log_error "Built a file with the same name(\`$(echo "$output_file" | sed -E 's/\-(debug|release)\.(apk|aab|jar)/\.\2'/g)\`) in different gradle tasks."
+            return 1
+          fi
+
+          file_map="$file_map
+      $output_file:$generated_file"
+        }
+
+        local old_ifs=$IFS
+        IFS=$'\n'
+        local artifact
+        for artifact in $(
+          find "$gradle_project_dir_rel_to_run_dir" \
+            -name '*\.apk' -o -name '*\.aab' -o -name '*\.jar' |
+            grep -E '/build/(outputs/(apk|bundle)/|libs/.*jar)' || true
+        ); do
+          IFS=$old_ifs
+
+          check_same_name "$artifact" "$(basename "$artifact" | sed -E 's/-release\.(apk|aab|jar)$/\.\1/g')"
+
+          if (echo "$artifact" | grep -qE '\-debug\.(apk|aab|jar)'); then
+            mkdir -p "$out_dir/debug"
+            mv "$artifact" "$out_dir/debug"
+            continue
+          fi
+
+          mkdir -p "$out_dir/release"
+
+          if [ "$gen_mapping_and_symbols" == 'true' ]; then
+            local variant
+            variant=$(echo "$artifact" | awk -F '/build/outputs/apk/' '{print $2}' | awk -F '/' '{print $1}')
+            if [ "$variant" != "release" ]; then
+              variant="${variant}Release"
+            fi
+
+            local module_path
+            module_path=$(echo "$artifact" | sed -E 's/(.*)\/build\/(outputs|libs)\/.*/\1/g')
+
+            if [ -d "$module_path/build/outputs/mapping/$variant" ]; then
+              local filename
+              filename=$(basename "$artifact" | sed -E 's/(\-release)?.(apk|aab|jar)$//g')
+
+              tar czvf "$out_dir/release/$filename-mapping.tar.gz" \
+                -C "$module_path/build/outputs/mapping/$variant" \
+                $(ls "$module_path/build/outputs/mapping/$variant")
+
+              if [ -f "$module_path/build/outputs/native-debug-symbols/$variant/native-debug-symbols.zip" ]; then
+                mv "$module_path/build/outputs/native-debug-symbols/$variant/native-debug-symbols.zip" \
+                  "$out_dir/release/$filename-native-debug-symbols.zip"
+              fi
+            fi
+          fi
+
+          mv "$artifact" "$out_dir/release/$(basename "$artifact" | sed -E 's/-release\.(apk|aab|jar)$/\.\1/g')"
+          continue
+        done
+
+        unset check_same_name
+      }
+
+      st_build_gradle_lint() {
+        local project_dir=${1:-.}
+        local out_dir=${2:-out}
+        local gradle_sub_project=${3:-}
+        local gradle_project_dir=${4:-}
+
+        gradle_sub_project=$(echo "$gradle_sub_project" | sed -E 's/^:*/:/g' | sed -E 's/:*$//g')
+        gradle_project_dir=$(echo "$gradle_project_dir" | sed -E 's/^(\.$|\.\/+)//g')
+        local gradle_project_dir_rel_to_run_dir="$project_dir$([ -n "$gradle_project_dir" ] && echo "/$gradle_project_dir")"
+
+        local gradle_sub_projects_to_lint=
+        if [ -z "$gradle_sub_project" ]; then
+          gradle_sub_projects_to_lint=$(
+            sh "$project_dir/gradlew" -p "$gradle_project_dir_rel_to_run_dir" projects |
+              (grep -E ' *.?--- Project ' || true) |
+              sed -E 's/.*--- Project //g' |
+              awk -F "'" '{print $2}' |
+              sort |
+              uniq
+          )
+
+          # `$gradle_sub_projects_to_lint` has no value when `$gradle_project_dir` has no sub-projects.
+        fi
+
+        if [ -z "$gradle_sub_projects_to_lint" ]; then
+          gradle_sub_projects_to_lint=$(
+            echo "$gradle_sub_project" &&
+              sh "$project_dir/gradlew" -p "$gradle_project_dir_rel_to_run_dir" "$([ -n "$gradle_sub_project" ] && echo "$gradle_sub_project":)"dependencies |
+                (grep -E ' *\.?--- project ' || true) |
+                sed -E 's/.*--- project //g' |
+                (grep -Ev ' (\(.?\)|FAILED)$' || true) |
+                sed -E '/^$/d' |
+                sort | uniq
+          )
+        fi
+
+        if [ -z "$gradle_sub_projects_to_lint" ]; then
+          st_log_error "No lintable gradle sub-projects found."
+          return 1
+        fi
+
+        local reports_dir="$project_dir/build/reports/$(date +%s | md5sum | awk '{print $1}' | cut -c 1-7)"
+        local lint_results_dir="$reports_dir/lint-results"
+        mkdir -p "$lint_results_dir"
+
+        local gradle_sub_project_to_lint
+        local result_summary=
+        local lint_result_files=
+        local ret
+        let ret=0 || :
+
+        for gradle_sub_project_to_lint in $gradle_sub_projects_to_lint; do
+          local module_dir="$(echo "$gradle_sub_project_to_lint" | sed -E 's/:/\//g' | sed -E 's/^\///g')"
+
+          if ! ([ -f "$project_dir/$module_dir/build.gradle" ] || [ -f "$project_dir/$module_dir/build.gradle.kts" ]); then
+            continue
+          fi
+
+          echo "Execute lint task for \`$gradle_sub_project_to_lint\`."
+          if sh "$project_dir/gradlew" --parallel -p "$gradle_project_dir_rel_to_run_dir" "$gradle_sub_project_to_lint":lintRelease; then
+            result_summary="$result_summary
+      $gradle_sub_project_to_lint --- pass"
+          else
+            if ! [ -f "$project_dir/$module_dir/build/reports/lint-results-release.html" ]; then
+              result_summary="$result_summary
+      $gradle_sub_project_to_lint --- fail(build)"
+              continue
+            fi
+
+            result_summary="$result_summary
+      $gradle_sub_project_to_lint --- fail"
+            let ret=1
+          fi
+
+          local dest_filename="$(echo "$module_dir" | sed -E 's/\//-/g')-lint-results.html"
+          cp "$project_dir/$module_dir/build/reports/lint-results-release.html" "$lint_results_dir/$dest_filename"
+          lint_result_files="$lint_result_files
+      lint-results/$dest_filename"
+        done
+
+        echo "$result_summary" | column -t | tee "$reports_dir/lint-result-summary.txt"
+
+        local filename_prefix
+        if [ -n "$gradle_sub_project" ]; then
+          filename_prefix="$(echo "$gradle_sub_project" | sed -E 's/:+/-/g' | sed -E 's/^-+//g')-"
+        elif [ -n "$gradle_project_dir" ]; then
+          filename_prefix="$(echo "$gradle_project_dir" | sed -E 's/\//-/g' | sed -E 's/\-+$//g')-"
+        else
+          filename_prefix=
+        fi
+
+        mkdir -p "$out_dir"
+        echo "lint-result-summary.txt
+      $lint_result_files" | tar -C "$reports_dir" -czvf "$out_dir/${filename_prefix}reports-android-lint.tar.gz" --files-from -
+
+        return $ret
+      }
+
+      st_build_swift_lint() {
+        local project_dir=${1:-.}
+        local out_dir=${2:-out}
+        local config_file=${3:-}
+        local config_file_arg
+
+        if [ -n "$config_file" ]; then
+          if ! [ -f "$project_dir/$config_file" ]; then
+            st_log_error "No \`$project_dir/$config_file\` file was found."
+            return 1
+          fi
+
+          config_file_arg="--config $project_dir/$config_file"
+        else
+          config_file=".swiftlint.yml"
+
+          if [ -f "$project_dir/$config_file" ]; then
+            config_file_arg="--config $project_dir/$config_file"
+          else
+            st_log_warn "It is recommended to add a \`$project_dir/.swiftlint.yml\` file."
+            config_file_arg=
+          fi
+        fi
+
+        mkdir -p "$out_dir"
+        swiftlint lint $config_file_arg --reporter "html" --no-cache --strict "$project_dir" >"$out_dir/swift-lint-results.html"
+      }
+
+      st_build_xcode_build() {
+        local project_dir=${1:-.}
+        local out_dir=${2:-out}
+        local xcodegen_yml=${3:-project.yml}
+        local scheme=${4:-}
+        local file_filter_regex=${5:-.*}
+        local export_for_app_store=${6:-false}
+
+        local xcodeproj_name
+        xcodeproj_name=$(cat "$project_dir/$xcodegen_yml" | (grep -Eo '^ *name: *[0-9a-zA-Z_\-]+ *$' || true) | awk -F ' ' '{print $2}')
+        if [ -z "$xcodeproj_name" ]; then
+          st_log_error "Illegal xcodeproj name. Check your \`$$project_dir/$xcodegen_yml\` file."
+          return 1
+        fi
+
+        rm -rf "$project_dir/$xcodeproj_name.xcodeproj"
+        xcodegen --spec "$project_dir/$xcodegen_yml" --project "$project_dir"
+
+        mkdir -p "$project_dir/DerivedData-$xcodeproj_name"
+        local derived_data_path
+        derived_data_path=$(cd "$project_dir/DerivedData-$xcodeproj_name" && pwd)
+
+        if [ -z "$scheme" ]; then
+          scheme=$xcodeproj_name
+        fi
+
+        print_product_bundle_package_type() {
+          xcrun xcodebuild \
+            -derivedDataPath "$derived_data_path" \
+            -project "$project_dir/$xcodeproj_name.xcodeproj" \
+            -scheme "$scheme" \
+            -showBuildSettings 2>/dev/null |
+            (grep -Eo 'PRODUCT_BUNDLE_PACKAGE_TYPE = .*' || true)
+        }
+
+        local product_bundle_package_type
+        product_bundle_package_type=$(print_product_bundle_package_type)
+        unset print_product_bundle_package_type
+
+        mkdir -p "$out_dir/Release"
+
+        if (echo "$product_bundle_package_type" | grep -qE ' FMWK$'); then
+          xcrun xcodebuild \
+            -derivedDataPath "$derived_data_path" \
+            -project "$project_dir/$xcodeproj_name.xcodeproj" \
+            -scheme "$scheme" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' |
+            xcbeautify
+
+          local frameworks_and_bundles
+          frameworks_and_bundles=$(
+            ls -1 "$derived_data_path/Build/Products/Release-iphoneos" |
+              (grep -E "^$file_filter_regex\.(framework|bundle)$" || true)
+          )
+          if [ -z "$frameworks_and_bundles" ]; then
+            st_log_error "No frameworks or bundles found after filtering by the \`$file_filter_regex\` regex."
+            return 1
+          fi
+
+          local framework
+          local framework_name
+          local swift_header_dir
+          local swift_header_file
+          for framework in $(echo "$frameworks_and_bundles" | grep -E '\.framework$' || true); do
+            framework_name=$(echo "$framework" | sed -E 's/\.framework$//g')
+            swift_header_dir="$derived_data_path/Build/Products/Release-iphoneos/$framework/Headers"
+            swift_header_file="$derived_data_path/Build/Intermediates.noindex/$xcodeproj_name.build/Release-iphoneos/$framework_name.build/DerivedSources/$framework_name-Swift.h"
+            if (! [ -d "$swift_header_dir" ]) && [ -f "$swift_header_file" ]; then
+              mkdir -p "$swift_header_dir"
+              cp -f "$swift_header_file" "$swift_header_dir"
+            fi
+
+            echo "swift_header_dir: $swift_header_dir"
+            echo "swift_header_file: $swift_header_file"
+          done
+
+          echo "$frameworks_and_bundles" |
+            xargs tar -C "$derived_data_path/Build/Products/Release-iphoneos" -czvf "$out_dir/Release/$scheme-frameworks.tar.gz" --files-from -
+
+          ls -1 "$derived_data_path/Build/Products/Release-iphoneos" |
+            (grep -E "^$file_filter_regex\.framework.dSYM$" || true) |
+            st_compatible_xargs_i_r tar -C "$derived_data_path/Build/Products/Release-iphoneos" -czvf "$out_dir/Release/$scheme-framework-dSYMs.tar.gz" --files-from -
+
+          return $?
+        fi
+
+        if ! (echo "$product_bundle_package_type" | grep -qE ' APPL$'); then
+          st_log_error "Unsupported PRODUCT_BUNDLE_PACKAGE_TYPE: $product_bundle_package_type"
+          return 1
+        fi
+
+        mkdir -p "$derived_data_path/Archives"
+        xcrun xcodebuild \
+          -derivedDataPath "$derived_data_path" \
+          -project "$project_dir/$xcodeproj_name.xcodeproj" \
+          -scheme "$scheme" \
+          -configuration Release \
+          -destination 'generic/platform=iOS' \
+          -allowProvisioningUpdates \
+          -archivePath "$derived_data_path/Archives/$scheme.xcarchive" \
+          archive | xcbeautify
+
+        st_build_xcode_export_ipa() {
+          local xcarchive_file=${1:?Missing argument \`\$1 - xcarchive_file\` when calling st_build_xcode_export_ipa.}
+          local export_method=${2:?Missing argument \`\$2 - export_method\` when calling st_build_xcode_export_ipa.} # xcodebuild --help
+
+          local plist_file="$derived_data_path/Archives/ExportOptions-$export_method.plist"
+          cat >"$plist_file" <<EOF
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      <plist version="1.0">
+        <dict>
+          <key>method</key>
+          <string>$export_method</string>
+        </dict>
+      </plist>
+      EOF
+
+          rm -rf "$derived_data_path/Archives/ExportedIpa-$export_method"
+          xcrun xcodebuild \
+            -exportArchive \
+            -exportOptionsPlist "$plist_file" \
+            -allowProvisioningUpdates \
+            -archivePath "$xcarchive_file" \
+            -exportPath "$derived_data_path/Archives/ExportedIpa-$export_method" |
+            xcbeautify
+          mv "$derived_data_path/Archives/ExportedIpa-$export_method"/*.ipa "$out_dir/Release/$scheme-$(echo "$export_method" | sed 's/-/_/g').ipa"
+        }
+
+        tar -C "$derived_data_path/Archives/$scheme.xcarchive/dSYMs" -czvf "$out_dir/Release/$scheme.app.dSYM.tar.gz" $scheme.app.dSYM
+
+        st_build_xcode_export_ipa "$derived_data_path/Archives/$scheme.xcarchive" 'development'
+        if [ "$export_for_app_store" = 'true' ]; then
+          st_build_xcode_export_ipa "$derived_data_path/Archives/$scheme.xcarchive" 'app-store'
+        fi
+
+        unset st_build_xcode_export_ipa
+      }
+
+      st_build_xcode_clean() {
+        local project_dir=${1:-.}
+        local clean_cache=${2:-false}
+
+        local derived_data
+        for derived_data in $(ls -1 "$project_dir" | (grep -E 'DerivedData.*' || true)); do
+          if [ "$clean_cache" = 'true' ]; then
+            rm -rf "$project_dir/$derived_data"
+          else
+            rm -rf "$project_dir/$derived_data/Build"
+            rm -rf "$project_dir/$derived_data/Logs"
+            rm -rf "$project_dir/$derived_data/info.plist"
+            rm -rf "$project_dir/$derived_data/Archives"
+            rm -rf "$project_dir/$derived_data/Frameworks"
+          fi
+        done
+      }
+
+      st_build_upload_ios_app_to_app_store_connect() {
+        local app_path=${1:?Missing argument \`\$1 - app_path\` when calling st_build_upload_ios_app_to_app_store_connect.}
+        local username=${2:?Missing argument \`\$3 - username\` when calling st_build_upload_ios_app_to_app_store_connect.}
+
+        # protect `password`
+        local print_commands
+        print_commands=$(if echo "$-" | grep -q 'x'; then echo 'true'; fi)
+        if [ -n "$print_commands" ]; then set +x; fi
+
+        # About passowrd: https://support.apple.com/zh-cn/HT204397
+        local password=${3:?Missing argument \`\$3 - password\` when calling st_build_upload_ios_app_to_app_store_connect.}
+
+        xcrun altool --upload-app -f "$app_path" -t ios -u "$username" -p "$password"
+
+        if [ -n "$print_commands" ]; then set -x; fi
+      }
+
+      st_build_read_change_log_of_version() {
+        local change_log_file=${1:?Missing argument \`\$1 - change_log_file\` when calling st_build_read_change_log_of_version.}
+        local version=${2:?Missing argument \`\$3 - version\` when calling st_build_read_change_log_of_version.}
+
+        local output
+        if output=$(sed -nE "/## $version/,/^## .*$st_build_semver_regex/p" "$change_log_file" | (grep -vE "## .*$st_build_semver_regex" || true) | sed '/./,/^$/!d') && [ -n "$output" ]; then
+          echo "## $version - $(date +%D)
+
+      $output"
+          return 0
+        fi
+
+        st_log_error "\`$change_log_file\` an invalid CHANGELOG markdown file.
+      See the following template.
+
+      \`\`\`md
+      ## 1.1.0
+
+      ### 特性
+
+      1. 新增 x 功能
+      1. 新增 y 功能
+
+      ### 改进
+
+      1. 吞吐提高 x%
+      1. 延时降低 y%
+
+      ### 问题修复
+
+      1. 修复 x 问题
+      1. 修复 x 问题
+
+      ## 1.0.0
+
+      ### 特性
+
+      1. 新增 x 功能
+      1. 新增 y 功能
+
+      ### 改进
+
+      1. 吞吐提高 x%
+      1. 延时降低 y%
+
+      ### 问题修复
+
+      1. 修复 x 问题
+      1. 修复 x 问题
+
+      \`\`\`
+
+      Note: Choose the right header. ## for version, and ### for 特性(Features)/改进(Improvement)/问题修复(Bug fixes)
+      "
+      }
+
+      # module: compatible
+      if [ "$(uname)" = 'Darwin' ]; then
+        st_compatible_xargs_i_r() {
+          xargs -I {} sh -c "[ -n {} ] && $*"
+        }
+      else
+        st_compatible_xargs_i_r() {
+          xargs -ri sh -c "$*"
+        }
+      fi
+
+      # module: fs
+      st_fs_get_cache_dir() {
+        local bin_name=${1:?Missing argument \`\$1 - bin_name\` when calling st_fs_get_cache_dir.}
+
+        local cache_dir="$HOME/.cache/sh-toolbox/$bin_name"
+        echo "$cache_dir"
+
+        mkdir -p "$cache_dir"
+      }
+
+      st_fs_file_lock() {
+        local path=${1:?Missing argument \`\$1 - path\` when calling st_fs_file_lock.}
+        local fd=${2:?Missing argument \`\$1 - path\` when calling st_fs_file_lock.}
+        local block=${3:-}
+
+        mkdir -p "$(dirname "$path")"
+        eval "exec $fd> \"$path\""
+
+        local block_arg=
+        if [ -z "$block" ]; then
+          block_arg="-n"
+        fi
+
+        if ! flock $block_arg $fd; then
+          return 1
+        fi
+
+        eval "echo $$ 1>&$fd"
+      }
+
+      st_fs_install_command() {
+        local command_dir=${1:?Missing argument \`\$1 - command_dir\` when calling st_fs_install_command.}
+        local command_url=${2:?Missing argument \`\$2 - command_url\` when calling st_fs_install_command.}
+        local command_name=${3:?Missing argument \`\$3 - command_name\` when calling st_fs_install_command.}
+
+        st_fs_download_file "$command_url" "$command_dir" "$command_name"
+
+        local command_abs_dir
+        command_abs_dir=$(cd -- "$command_dir" && pwd)
+        chmod +x "$command_abs_dir/$command_name"
+
+        if ! (echo "$PATH" | grep -Eq "$command_abs_dir"); then
+          export PATH="$command_abs_dir:$PATH"
+        fi
+      }
+
+      st_gitlab_install_command() {
+        local gitlab_raw_file_url=${1:?Missing argument \`\$1 - gitlab_raw_file_url\` when calling st_gitlab_install_command.}
+        local command_dir=${2:?Missing argument \`\$2 - command_dir\` when calling st_gitlab_install_command.}
+        local command_name=${3:?Missing argument \`\$3 - command_name\` when calling st_gitlab_install_command.}
+        local gitlab_api_v4_url=${4:?Missing argument \`\$4 - gitlab_api_v4_url\` when calling st_gitlab_install_command.}
+        local gitlab_token=${5:?Missing argument \`\$5 - gitlab_token\` when calling st_gitlab_install_command.}
+
+        local project
+        project=$(echo "$gitlab_raw_file_url" | awk -F '/-/raw/' '{print $1}' | sed -E 's/^https?:\/\/[a-z\.]+\///g')
+        local file_path
+        file_path=$(echo "$gitlab_raw_file_url" | awk -F '/-/raw/' '{print $NF}')
+        local ref
+        ref=$(dirname "$file_path")
+        file_path=$(basename "$file_path")
+
+        mkdir -p "$command_dir"
+        curl \
+          --progress-bar \
+          --header "PRIVATE-TOKEN: $gitlab_token" \
+          --output "$command_dir/$command_name" \
+          "$gitlab_api_v4_url/projects/$(echo "$project" | sed -E 's/\//%2F/g')/repository/files/$(echo "$file_path" | sed -E 's/\//%2F/g')/raw?ref=$ref"
+
+        local command_abs_dir
+        command_abs_dir=$(cd -- "$command_dir" && pwd)
+        chmod +x "$command_abs_dir/$command_name"
+
+        if ! (echo "$PATH" | grep -Eq "$command_abs_dir"); then
+          export PATH="$command_abs_dir:$PATH"
+        fi
+      }
+
+      st_fs_download_file() {
+        local url=${1:?Missing argument \`\$1 - url\` when calling st_fs_download_file.}
+        local directory=${2:?Missing argument \`\$2 - directory\` when calling st_fs_download_file.}
+        local filename=${3:?Missing argument \`\$3 - filename\` when calling st_fs_download_file.}
+
+        mkdir -p "$directory"
+        local abs_dir
+        abs_dir=$(cd -- "$directory" && pwd)
+
+        if (which curl >&/dev/null); then
+          curl -L "$url" -o "$abs_dir/$filename"
+        elif (which wget >&/dev/null); then
+          wget "$url" -O "$abs_dir/$filename"
+        else
+          st_log_error "wget or curl not found when calling st_fs_download_file."
+          return 1
+        fi
+      }
+
+      st_fs_add_host() {
+        local domain=${1:?Missing argument \`\$1 - domain\` when calling st_fs_add_host.}
+        local ip=${2:?Missing argument \`\$2 - ip\` when calling st_fs_add_host.}
+
+        if (grep -Eq "$domain" /etc/hosts); then
+          echo "$(sed "s/.*$domain/$ip $domain/g" /etc/hosts)" >/etc/hosts # if you use `sed -i ...` directly, it will fail and prompt: sed: can't move '/etc/hosts...' to '/etc/hosts': Resource busy.
+        else
+          echo "$ip $domain" >>/etc/hosts
+        fi
+      }
+
+      st_fs_read_string_from_text_file() {
+        local text_file=${1:?Missing argument \`\$1 - text_file\` when calling st_fs_read_string_from_text_file.}
+        local string_regex=${2:?Missing argument \`\$2 - string_regex\` when calling st_fs_read_string_from_text_file.}
+        local line_regex=${3-.*}
+
+        grep -E "$line_regex" "$text_file" | grep -Eo "$string_regex"
+      }
+
+      st_fs_write_string_into_text_file() {
+        local text_file=${1:?Missing argument \`\$1 - text_file\` when calling st_fs_write_string_into_text_file.}
+        local string_content=${2:?Missing argument \`\$2 - string_content\` when calling st_fs_write_string_into_text_file.}
+        local string_regex=${3:?Missing argument \`\$3 - string_regex\` when calling st_fs_write_string_into_text_file.}
+        local line_regex=${4-.*}
+
+        if [ "$(uname)" = 'Darwin' ]; then
+          if [ -L "$text_file" ]; then
+            sed -Ei '' "/$line_regex/s/$string_regex/$string_content/g" "$(readlink -f $text_file)"
+          else
+            sed -Ei '' "/$line_regex/s/$string_regex/$string_content/g" "$text_file"
+          fi
+        else
+          sed -Ei --follow-symlinks "/$line_regex/s/$string_regex/$string_content/g" "$text_file"
+        fi
+      }
+
+      # module: git
+      st_git_config_user_name_email() {
+        local user_name=${1:?Missing argument \`\$1 - user_name\` when calling st_git_config_user_name_email.}
+        local user_email=${2:?Missing argument \`\$2 - user_email\` when calling st_git_config_user_name_email.}
+
+        git config --global user.name "$user_name"
+        git config --global user.email "$user_email"
+      }
+
+      st_git_config_color_ui() {
+        local color_option=${1:-auto}
+        if !(echo "$color_option" | grep -E '(always|auto|false|never|no|off|on|true|yes)'); then
+          st_log_error "Illegal argument \`\$1 - color_option\`($color_option) when calling st_git_config_color_ui. Should be one of always|auto|false|never|no|off|on|true|yes."
+          return 1
+        fi
+
+        git config --global color.ui "$color_option"
+      }
+
+      st_git_clone() {
+        local repository=${1:?Missing argument \`\$1 - repository\` when calling st_git_clone.}
+        local ref_or_commit=${2:-}
+        local directory=${3:-$(basename "$repository" | sed 's|\.git$||g')}
+        local depth=${4:-}
+
+        if [ -n "$depth" ] && (!(st_number_is_int "$depth") || [ $depth -le 0 ]); then
+          st_log_error "Illegal argument \`\$4 - depth\` (should: int, > 0) when calling st_git_clone."
+          return 1
+        fi
+
+        git init "$directory"
+        cd "$directory" # cd {
+
+        git remote remove origin 2>/dev/null || true
+        git remote add origin "$repository"
+
+        if [ -z "$ref_or_commit" ]; then
+          ref_or_commit=$(git remote show origin | grep -E 'HEAD branch:' | awk -F ': ' '{print $NF}')
+        fi
+
+        local depth_arg="$([ -n "$depth" ] && echo "--depth=$depth")"
+        git fetch --progress $depth_arg origin $ref_or_commit
+        git reset --hard FETCH_HEAD
+
+        cd $OLDPWD # } cd
+      }
+
+      st_git_info() {
+        local repo_root=${1:-.}
+        cd "$repo_root" # cd {
+
+        echo "Repo Url: $(git remote get-url origin)
+      Commit Id: $(git rev-parse HEAD)
+      Author: $(git log --format='%an <%ae>' -1)
+      Date: $(git log --format='%ad' -1)"
+
+        local tags
+        tags=$(git tag --points-at HEAD | xargs echo | sed 's/ /, /g')
+        if [ -n "$tags" ]; then
+          echo "Tags: $tags"
+        fi
+
+        cd $OLDPWD # } cd
+      }
+
+      # module: log
+      st_log_no_color=${st_log_no_color:-}
+
+      st_log_debug() {
+        if [ -n "$st_log_no_color" ]; then
+          printf "[debug] $*\n"
+        else
+          printf "\033[90m[debug]\033[0m $*\n"
+        fi
+      }
+
+      st_log_info() {
+        printf "$*\n"
+      }
+
+      st_log_warn() {
+        if [ -n "$st_log_no_color" ]; then
+          printf >&2 "[warn] $*\n"
+        else
+          printf >&2 "\033[93m[warn]\033[0m $*\n"
+        fi
+      }
+
+      st_log_error() {
+        if [ -n "$st_log_no_color" ]; then
+          printf >&2 "[error] $*\n"
+        else
+          printf >&2 "\033[91m[error]\033[0m $*\n"
+        fi
+      }
+
+      st_log_fatal() {
+        if [ -n "$st_log_no_color" ]; then
+          printf >&2 "[fatal] $*\n"
+        else
+          printf >&2 "\033[101m[fatal]\033[0m $*\n"
+        fi
+      }
+
+      # module: number
+      st_number_is_int() {
+        local input=${1:-}
+        printf %d "$input" >&/dev/null
+      }
+
+      # module: repo
+      st_repo_init_and_sync() {
+        local manifest_url=${1:?Missing argument \`\$1 - manifest_url\` when calling st_repo_init_and_sync.}
+        local ref_or_commit=${2:-}
+        local directory=${3:-$(basename "$manifest_url" | sed 's|\.git$||g')}
+        local depth=${4:-}
+        local manifest_name=${5:-}
+
+        if [ -n "$depth" ] && (!(st_number_is_int "$depth") || [ $depth -le 0 ]); then
+          st_log_error "Illegal argument \`\$4 - depth\` (should: int, > 0) when calling st_repo_init_and_sync."
+          return 1
+        fi
+
+        local available_ref_or_commit=$ref_or_commit
+        if [ -n "$ref_or_commit" ] && (git ls-remote "$manifest_url" | grep -qE "refs/tags/$ref_or_commit$"); then
+          available_ref_or_commit=$(git ls-remote "$manifest_url" | (grep -E "refs/tags/$ref_or_commit$" || true) | awk '{print $1}')
+          st_log_info "\`repo init\` with \`-b $available_ref_or_commit\`(tag: $ref_or_commit)"
+        fi
+
+        mkdir -p "$directory"
+        cd "$directory" # cd {
+
+        local manifest_branch_arg
+        manifest_branch_arg=$(if [ -n "$available_ref_or_commit" ]; then echo "-b $available_ref_or_commit"; fi)
+        local depth_arg
+        depth_arg=$(if [ -n "$depth" ]; then echo "--depth $depth"; fi)
+        local manifest_name_arg
+        manifest_name_arg=$(if [ -n "$manifest_name" ]; then echo "-m $manifest_name"; fi)
+
+        repo init -u "$manifest_url" $manifest_branch_arg $depth_arg $manifest_name_arg
+        repo forall --ignore-missing -ve -c sh -c 'pwd && git checkout . && git clean -df' # when no sh -c ..., this command may fail on windows & macOS.
+        if [ "$(uname)" = 'Darwin' ]; then
+          repo sync -d --force-sync --force-remove-dirty --prune -j $(sysctl -n hw.physicalcpu)
+        else
+          repo sync -d --force-sync --force-remove-dirty --prune -j $(nproc)
+        fi
+
+        cd $OLDPWD # } cd
+      }
+
+      st_repo_info() {
+        local repo_root=${1:-.}
+        cd "$repo_root" # cd {
+
+        if (uname | grep -qE '^MINGW'); then
+          local drive_symbol
+          drive_symbol=$(repo info | grep -oE 'path: +[A-Z]:' | grep -oE '[A-Z]' | uniq | head -n 1 | tr A-Z a-z)
+          repo info | sed -E "s/path: +[A-Z]:/path: \/$drive_symbol/g" | sed -E -e '\|Local Branches|d' -e "s|$PWD/||g" -e 's|\x1B\[[0-9;]*[JKmsu]||g'
+        else
+          repo info | sed -E -e '\|Local Branches|d' -e "s|$PWD/||g" -e 's|\x1B\[[0-9;]*[JKmsu]||g'
+        fi
+
+        cd $OLDPWD # } cd
+      }
+
+      # module: ssh
+      st_ssh_write_private_key() {
+        local key_type=${2:-rsa} # dsa | ecdsa | ed25519 | rsa
+        local key_filename=${3:-id_${key_type}}
+
+        # protect `key_content`
+        local print_commands
+        print_commands=$(if echo "$-" | grep -q 'x'; then echo 'true'; fi)
+        if [ -n "$print_commands" ]; then set +x; fi
+
+        local key_content=${1:?Missing argument \`\$1 - key_content\` when calling st_ssh_write_private_key.}
+
+        mkdir -p $HOME/.ssh
+        chmod 700 $HOME/.ssh
+
+        if ! (echo "$key_content" | grep -Eq -- '-----BEGIN'); then
+          local decoded_content="$(echo "$key_content" | base64 -d 2>/dev/null)"
+
+          if ! (echo "$decoded_content" | grep -Eq -- '-----BEGIN'); then
+            st_log_error "Invalid ssh private key content."
+            if [ -n "$print_commands" ]; then set -x; fi
+            return 1
+          fi
+
+          key_content="$decoded_content"
+        fi
+
+        local key_file="$HOME/.ssh/${key_filename}"
+        if [ -f "$key_file" ]; then
+          mv "$key_file" "${key_file}.backup.$(date +%s)"
+        fi
+
+        echo "$key_content" >"$key_file"
+        chmod 600 "$key_file"
+
+        if [ -n "$print_commands" ]; then set -x; fi
+      }
+
+      st_ssh_write_common_config_for_all_hosts() {
+        mkdir -p "$HOME/.ssh"
+        chmod 700 "$HOME/.ssh"
+
+        echo "HOST *
+        StrictHostKeyChecking no
+        UserKnownHostsFile /dev/null
+        LogLevel ERROR" >"$HOME/.ssh/config"
+        chmod 600 "$HOME/.ssh/config"
+      }
+
+      # start here
+      env | grep -E '^PCI_' || true
+
+      export TZ='Asia/Shanghai'
+
+      # Cleanup `tmp` & `artifact` directories
+      (
+        echo '.ci-tmp' \
+        && \
+        (
+          [ -d "." ] \
+          && (
+            ls -1 "." \
+            | (grep -iE '^([dD]ebug|[rR]elease|[rR]eports|.*repo-info\.txt|.*head-manifest\.xml|.*sha256sum\.txt|__args__)$' || true)
+          ) | st_compatible_xargs_i_r echo "./{}"
+        )
+      ) | st_compatible_xargs_i_r rm -rf "{}"
+
+      st_ssh_write_common_config_for_all_hosts
+      st_ssh_write_private_key "$machine_user_ssh_private_key" "ed25519" ""
+
+      # hosts for google
+      st_fs_add_host "dl-ssl.google.com" "203.208.40.33"
+      st_fs_add_host "dl.google.com" "203.208.40.33"
+      st_fs_add_host "www.google.com" "203.208.40.33"
+
+      st_git_config_color_ui "on"
+      st_git_config_user_name_email "Machine" "machine@ci"
+
+      st_gitlab_install_command \
+        "https://gitlab.ubtrobot.com/rosa-dev/git-repo/-/raw/stable/repo" \
+        ".ci-tmp/bin" \
+        "repo" \
+        "$CI_API_V4_URL" \
+        "$machine_user_gitlab_token"
+      export REPO_URL="git@gitlab.ubtrobot.com:rosa-dev/git-repo.git"
+
+      st_repo_init_and_sync "$(echo "$CI_REPOSITORY_URL" | sed -E 's/^.*gitlab\.ubtrobot\.com\//git@gitlab.ubtrobot.com:/g')" "$CI_COMMIT_REF_NAME" "." "1" "$([ -n "$CI_COMMIT_TAG" ] && echo "$CI_COMMIT_TAG".xml)"
+      st_repo_info "." | tee "repo-info.txt"
+      repo manifest -r | tee "head-manifest.xml"
+
+      export GRADLE_USER_HOME="$PWD/.ci-tmp/gradle"
+      mkdir -p "$GRADLE_USER_HOME"
+      mkdir -p ".ci-cache/"{jdks,wrapper,caches}
+      ln -sfr ".ci-cache"/{jdks,wrapper,caches} ".ci-tmp/gradle"
+
+      st_build_gradle_add_property "gitlab_maven_url" "https://gitlab.ubtrobot.com/api/v4/projects/344/packages/maven"
+      st_build_gradle_add_property "gitlab_token" "$machine_user_gitlab_token"
+
+      st_build_check_semver_in_text_file "build.gradle.kts" 'extra\["version"\]'
+      g_version=$(st_build_read_semver_from_text_file "build.gradle.kts" 'extra\["version"\]')
+      echo "Version: $g_version"
+
+      st_build_prepare_build_numbers_repo "git@gitlab.ubtrobot.com:rosa/productivity/ci/build-numbers.git" "products/lawnmower/android" ".ci-tmp/build-numbers"
+      g_build_number=$(st_build_cal_incremental_build_number ".ci-tmp/build-numbers")
+      echo "Build Number: $g_build_number"
+
+      st_fs_write_string_into_text_file "build.gradle.kts" "$g_build_number" "[0-9]+" 'extra\["version-code"\]'
+
+      g_backend_env_regex="PRODUCTION|PRE_RELEASE|TEST"
+      case $PCI_BACKEND_ENV in
+      PRODUCTION)
+        st_fs_write_string_into_text_file "lawnmower/app/build.gradle.kts" "PRODUCTION" "($g_backend_env_regex)" 'com\.ubtrobot\.infrastructure\.BackendEnvConf\.Env\.(PRODUCTION|PRE_RELEASE|TEST)'
+        ;;
+      PRE_RELEASE)
+        st_fs_write_string_into_text_file "lawnmower/app/build.gradle.kts" "PRE_RELEASE" "($g_backend_env_regex)" 'com\.ubtrobot\.infrastructure\.BackendEnvConf\.Env\.(PRODUCTION|PRE_RELEASE|TEST)'
+        ;;
+      TEST)
+        st_fs_write_string_into_text_file "lawnmower/app/build.gradle.kts" "TEST" "($g_backend_env_regex)" 'com\.ubtrobot\.infrastructure\.BackendEnvConf\.Env\.(PRODUCTION|PRE_RELEASE|TEST)'
+        ;;
+      *)
+        st_log_error "\`$PCI_BACKEND_ENV\` is not a legal value. Chose frome \`$g_backend_env_regex\`."
+        ;;
+      esac
+
+      repo diff
+      
+      g_gradle_tasks=
+      if [ "$PCI_BUILD_TYPE" = 'RELEASE' ]; then
+        g_gradle_tasks="
+        assembleRelease
+        bundleRelease
+        "
+      else
+        g_gradle_tasks="
+        assembleDebug
+        bundleDebug
+        "
+      fi
+
+      for g_gradle_task in $g_gradle_tasks; do
+        if (echo "$g_gradle_task" | grep -qE ':?bundle.*$'); then
+          if [ "$PCI_AAB" != 'true' ]; then
+            continue
+          fi
+
+          st_log_info "Change the keystore(aab) for \`ROSA GU\`(KeyAlias)."
+          cat > "./gradle-shared/keystores/keystore.properties" <<EOF
+      keyAlias=ROSA GU
+      storePassword=$(echo "$rosa_android_gu_jks_store_password" | base64 -d -)
+      keyPassword=$(echo "$rosa_android_gu_jks_store_password" | base64 -d -)
+      EOF
+
+          echo "$rosa_android_gu_jks" | base64 -d - > "./gradle-shared/keystores/keystore.jks"
+          cp "./gradle-shared/keystores/keystore.jks" "./gradle-shared/keystores/for-aab-encrypting.jks"
+        else
+          st_log_info "Change the keystore for \`ROSA\`(KeyAlias)."
+          cat > "./gradle-shared/keystores/keystore.properties" <<EOF
+      keyAlias=ROSA
+      storePassword=$(echo "$rosa_android_jks_store_password" | base64 -d -)
+      keyPassword=$(echo "$rosa_android_jks_store_password" | base64 -d -)
+      EOF
+
+          echo "$rosa_android_jks" | base64 -d - > "./gradle-shared/keystores/keystore.jks"
+          cp "./gradle-shared/keystores/keystore.jks" "./gradle-shared/keystores/for-apk-encrypting.jks"
+        fi
+
+        st_build_android_gradle_build "." "." "$g_gradle_task" "lawnmower/app" true
+      done
+
+      if [ "$PCI_IJIAMI_ENCRYPT" = 'true' ]; then
+        st_gitlab_install_command \
+          'https://gitlab.ubtrobot.com/rosa-dev/external-tools/-/raw/ijiami/encryptiontool/encryptionTool-v4.3.2-202308/encryptionTool-v4.3.2-202308.jar' \
+          '.ci-tmp/encrypt' \
+          'encryption-tool.jar' \
+          "$CI_API_V4_URL" \
+          "$machine_user_gitlab_token"
+        g_encryption_tool='.ci-tmp/encrypt/encryption-tool.jar'
+
+      encrypt_apk_by_ijiami() {
+          local input_apk=$1
+          local output_dir=$2
+          local plan_id=$3
+
+          java -jar "$g_encryption_tool" \
+            -t apk \
+            -u "http://10.10.84.27/common" \
+            -r "ubtech" \
+            -w "$ijiami_aab_service_password" \
+            -k "$input_apk" \
+            -s "$plan_id" \
+            -d ".ci-tmp/encrypt"
+
+          # See https://developer.android.com/studio/build/building-cmdline#sign_cmdline
+          local encrypted_unsigned_apk=".ci-tmp/encrypt/$(basename "$input_apk" | sed -E 's/\.(apk)$/_unsigned.\1/g')"
+          local encrypted_unsigned_aligned_apk=$(echo "$encrypted_unsigned_apk" | sed -E 's/\.(apk)$/_aligned.\1/g')
+
+          $ANDROID_SDK_ROOT/build-tools/$(ls -1 $ANDROID_SDK_ROOT/build-tools | tail -n 1)/zipalign -v -p 4 \
+            "$encrypted_unsigned_apk" \
+            "$encrypted_unsigned_aligned_apk"
+
+          # protect `ks-pass`
+          local print_commands=$(echo "$-" | grep 'x')
+          if [ -n "$print_commands" ]; then set +x; fi
+
+          $ANDROID_SDK_ROOT/build-tools/$(ls -1 $ANDROID_SDK_ROOT/build-tools | tail -n 1)/apksigner sign \
+            --ks "./gradle-shared/keystores/for-apk-encrypting.jks" \
+            --ks-key-alias "ROSA" \
+            --ks-pass "pass:$(echo "$rosa_android_jks_store_password" | base64 -d -)" \
+            --in "$encrypted_unsigned_aligned_apk" \
+            --out "$output_dir/$(basename "$input_apk" | sed -E 's/\.(apk)/-encrypted.\1/g')"
+
+          if [ -n "$print_commands" ]; then set -x; fi
+        }
+
+      encrypt_aab_by_ijiami() {
+          local input_aab=$1
+          local output_dir=$2
+          local plan_id=$3
+
+          java -jar "$g_encryption_tool" \
+            -t aab \
+            -u "http://10.10.84.27/common" \
+            -r "ubtech" \
+            -w "$ijiami_aab_service_password" \
+            -k "$input_aab" \
+            -s "$plan_id" \
+            -d ".ci-tmp/encrypt"
+
+          local encrypted_unsigned_aab=".ci-tmp/encrypt/$(basename "$input_aab" | sed -E 's/\.(aab)$/_encrypt.\1/g')"
+
+          # protect `storepass`
+          local print_commands=$(echo "$-" | grep 'x')
+          if [ -n "$print_commands" ]; then set +x; fi
+
+          jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
+            -storepass "$(echo "$rosa_android_gu_jks_store_password" | base64 -d -)" \
+            -keystore "./gradle-shared/keystores/for-aab-encrypting.jks" \
+            -signedjar "$output_dir/$(basename "$input_aab" | sed -E 's/\.(aab)/-encrypted.\1/g')" \
+            "$encrypted_unsigned_aab" \
+            "ROSA GU"
+
+          if [ -n "$print_commands" ]; then set -x; fi
+        }
+
+        encrypt_apk_or_aab_by_ijiami() {
+          local filename_regex=$1
+          local plan_id=$2
+
+          local app=$(
+            [ -d "." ] && \
+            (
+              find "." -maxdepth 1 -type d \
+                | (grep -E "/[rR]elease$" || true) \
+                | st_compatible_xargs_i_r " \
+                  find \"{}\" -type f \
+                    | (grep -E \"/$filename_regex$\" || true)
+                "
+            )
+          )
+
+          if [ -z "$app" ]; then
+            st_log_warn "No app to be encrypted can be found through the \`$filename_regex\` regex."
+            return 0
+          fi
+
+          if [ "$(echo -n "$app" | wc -l)" -gt 1 ]; then
+            echo "$app"
+            st_log_error "Multiple apps above to be encrypted can be found through the \`$filename_regex\` regex."
+            return 1
+          fi
+
+          if (echo "$app" | grep -E '\.apk$'); then
+            encrypt_apk_by_ijiami "$app" "$(dirname "$app")" "$plan_id"
+            return $?
+          fi
+
+          if (echo "$app" | grep -E '\.aab$'); then
+            encrypt_aab_by_ijiami "$app" "$(dirname "$app")" "$plan_id"
+            return $?
+          fi
+
+          st_log_warn "The \`$app\` app to be encrypted does not match the \`$filename_regex\` regex. Check the \`regex\` config."
+          return 1
+        }
+
+        encrypt_apk_or_aab_by_ijiami "lawn-mower-local\.apk" "UMower"
+        encrypt_apk_or_aab_by_ijiami "lawn-mower-local\.aab" "UMowerAab"
+      fi
+
+      g_artifact_types="apk aab apk.idsig jar aar tar.gz zip"
+
+      # rename filenames with version and build number for artifact files
+      [ -d "." ] \
+      && (
+        suffix_regex="($(echo "$g_artifact_types" | sed -E -e 's/^ +//g' -e 's/ +$//g' -e 's/ +/|/g'))" \
+        && find "." -maxdepth 1 -type d \
+        | (grep -E "/([dD]ebug|[rR]elease|[rR]eports)$" || true) \
+        | st_compatible_xargs_i_r "find \"{}\" -type f \
+          | (grep -iE '\.$suffix_regex$' || true)" \
+        | st_compatible_xargs_i_r "
+          src=\"{}\" \
+          && dest=\$(echo \"\$src\" | sed -E \"s/\\.$suffix_regex$/-$g_version-BUILD.$g_build_number.\\1/g\") \
+          && mv \"\$src\" \"\$dest\"
+        "
+      )
+
+      # recalculate sha256sum for artifact files
+      [ -d "." ] \
+        && rm -rf "./sha256sum.txt" \
+        && find "." -maxdepth 1 -type d \
+        | (grep -E "/([dD]ebug|[rR]elease|[rR]eports)$" || true) \
+        | st_compatible_xargs_i_r "find \"{}\" -type f \
+          | sed -E 's/^\.\///g'" \
+        | st_compatible_xargs_i_r 'sha256sum "{}" >> "./sha256sum.txt"'
+
+      st_build_save_incremental_build_number ".ci-tmp/build-numbers"
+  artifacts:
+    paths:
+      - '[dD]ebug/'
+      - '[rR]elease/'
+      - '[rR]eports/'
+      - '*repo-info.txt'
+      - '*head-manifest.xml'
+      - '*sha256sum.txt'
+      - __args__
+    when: always
+  cache:
+    key: $CI_PROJECT_PATH_SLUG
+    paths:
+      - .ci-cache
+  rules:
+    - if: $PCI_VARIANT == "official" && $CI_PIPELINE_SOURCE =~ /(web|schedule)/
+stalco:
+  stage: build
+  tags:
+    - rosa
+    - linux
+  image:
+    name: rosa/android-sdk:36-20250715
+    entrypoint:
+      - ""
+  variables:
+    GIT_CHECKOUT: "false"
+    GIT_STRATEGY: none
+  script:
+    - |-
+      set -xeo pipefail
+
+      # sourced modules
+      # module: build
+      st_build_semver_regex='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(rc|alpha|beta)\.([1-9][0-9]*)){0,1}'
+
+      st_build_check_semver() {
+        local version=${1:?Missing argument \`\$1 - version\` when calling st_build_check_semver.}
+        if (echo "$version" | grep -Eq "^$st_build_semver_regex$"); then
+          return 0
+        else
+          st_log_error "Illegal semantic version. Should meet this regex: \`^$st_build_semver_regex$\`."
+          return 1
+        fi
+      }
+
+      st_build_check_semver_in_text_file() {
+        local text_file=${1:?Missing argument \`\$1 - text_file\` when calling st_build_check_semver_in_text_file.}
+        local version_line_regex=${2-.*}
+
+        local count
+        let count=$(grep -E "$version_line_regex" "$text_file" | grep -cE "$st_build_semver_regex" || true)
+        if [ $count -eq 1 ]; then
+          return 0
+        fi
+
+        if [ $count -eq 0 ]; then
+          st_log_error "A semantic-version is not found in \`$text_file\`."
+        else
+          st_log_error "Multiple semantic-versions are found in \`$text_file\`."
+        fi
+        return 1
+      }
+
+      st_build_read_semver_from_text_file() {
+        local text_file=${1:?Missing argument \`\$1 - text_file\` when calling st_build_read_semver_from_text_file.}
+        local version_line_regex=${2-.*}
+
+        st_fs_read_string_from_text_file "$text_file" "$st_build_semver_regex" "$version_line_regex"
+      }
+
+      st_build_bump_semver() {
+        local current=${1:?Missing argument \`\$1 - current\` when calling st_build_bump_semver.}
+        local increment_version=${2:?Missing argument \`\$2 - increment_version\` when calling st_build_bump_semver.}
+
+        # PATCH/MINOR/MAJOR
+        local major minor patch
+        let major=$(echo "$current" | awk -F '.' '{print $1}') || :
+        let minor=$(echo "$current" | awk -F '.' '{print $2}') || :
+        let patch=$(echo "$current" | awk -F '.' '{print $3}') || :
+
+        if [ "$increment_version" = "MAJOR" ]; then
+          let major=major+1 || :
+          let minor=0 || :
+          let patch=0 || :
+        elif [ "$increment_version" = "MINOR" ]; then
+          let minor=minor+1 || :
+          let patch=0 || :
+        elif [ "$increment_version" = "PATCH" ]; then
+          let patch=patch+1 || :
+        else
+          st_log_error "Illegal \`current\` version: $current."
+          return 1
+        fi
+
+        echo "$major.$minor.$patch"
+      }
+
+      st_build_prepare_build_numbers_repo() {
+        local repository=${1:?Missing argument \`\$1 - repository\` when calling st_build_prepare_build_numbers_repo.}
+        local branch=${2:?Missing argument \`\$2 - branch\` when calling st_build_prepare_build_numbers_repo.}
+        local directory=${3:?Missing argument \`\$3 - directory\` when calling st_build_prepare_build_numbers_repo.}
+
+        rm -rf "$directory"
+        if (git ls-remote "$repository" | grep -Eq "refs/heads/$branch$"); then
+          git clone -b "$branch" --depth 1 "$repository" "$directory"
+        else
+          git init "$directory"
+          git -C "$directory" remote add origin "$repository"
+
+          touch "$directory/BUILD_NUMBER"
+          git -C "$directory" add -A
+          git -C "$directory" commit -m 'add an empty BUILD_NUMBER file'
+          git -C "$directory" branch -m "$branch"
+        fi
+      }
+
+      st_build_cal_incremental_build_number() {
+        local repo_dir=${1:?Missing argument \`\$1 - repo_dir\` when calling st_build_cal_incremental_build_number.}
+
+        if [ -s "$repo_dir/BUILD_NUMBER" ]; then
+          local current incremental
+          let current=$(cat "$repo_dir/BUILD_NUMBER" | head -n 1) || [ -n "$current" ]
+          if [ $current -le 0 ]; then
+            st_log_error "Illegal build number in \`$repo_dir/BUILD_NUMBER\` which <= 0."
+            return 1
+          fi
+
+          let incremental=current+1
+          echo "$incremental"
+        else
+          echo "1"
+        fi
+      }
+
+      st_build_save_incremental_build_number() {
+        local repo_dir=${1:?Missing argument \`\$1 - repo_dir\` when calling st_build_save_incremental_build_number.}
+
+        local incremental
+        let incremental=$(st_build_cal_incremental_build_number "$repo_dir")
+        echo "$incremental" >"$repo_dir/BUILD_NUMBER"
+
+        git -C "$repo_dir" add 'BUILD_NUMBER'
+        git -C "$repo_dir" commit -m "build-number: $incremental"
+        git -C "$repo_dir" push origin "HEAD:refs/heads/$(git -C "$repo_dir" rev-parse --abbrev-ref HEAD)"
+      }
+
+      st_build_conan_add_or_update_remote() {
+        local remote_name=${1:?Missing argument \`\$1 - remote_name\` when calling st_build_conan_add_or_update_remote.}
+        local remote_url=${2:?Missing argument \`\$2 - remote_url\` when calling st_build_conan_add_or_update_remote.}
+
+        if (echo "$remote_url" | grep -Eq '^http://'); then
+          conan remote add -f "$remote_name" "$remote_url" False
+        else
+          conan remote add -f "$remote_name" "$remote_url"
+        fi
+      }
+
+      st_build_conan_user() {
+        local remote=${1:?Missing argument \`\$1 - remote\` when calling st_build_conan_user.}
+        local name=${2:?Missing argument \`\$2 - name\` when calling st_build_conan_user.}
+
+        # protect `password`
+        local print_commands
+        print_commands=$(if echo "$-" | grep -q 'x'; then echo 'true'; fi)
+        if [ -n "$print_commands" ]; then set +x; fi
+
+        local password=${3:?Missing argument \`\$3 - password\` when calling st_build_conan_user.}
+        conan user "$name" -r "$remote" -p "$password"
+
+        if [ -n "$print_commands" ]; then set -x; fi
+      }
+
+      st_build_conan_install() {
+        local project_dir=${1:-.}
+        local install_dir=${2:-build}
+        local profile_host=${3:-}
+        local other_args=
+        shift 3 2>/dev/null && other_args=$@
+
+        if [ -z "$profile_host" ]; then
+          sh -c "conan install \"$project_dir\" -if \"$install_dir\" $other_args"
+        else
+          sh -c "conan install \"$project_dir\" -if \"$install_dir\" -pr \"$profile_host\" $other_args"
+        fi
+
+        . "$install_dir"/activate.sh
+      }
+
+      st_build_cmake_generate() {
+        local project_dir=${1:-.}
+        local build_dir=${2:-build}
+        local install_dir=${3:-out}
+        local generator=${4:-Unix Makefiles}
+        local build_type=${5:-Debug}
+
+        local install_dir_arg="-DCMAKE_INSTALL_PREFIX=$install_dir"
+        local generator_arg="-G$generator"
+
+        if [ "Unix Makefiles" = "$generator" ]; then
+          cmake -S "$project_dir" -B "$build_dir" "$install_dir_arg" "$generator_arg" "-DCMAKE_BUILD_TYPE=$build_type"
+        else
+          cmake -S "$project_dir" -B "$build_dir" "$install_dir_arg" "$generator_arg"
+        fi
+      }
+
+      st_build_cmake_build() {
+        local build_dir=${1:-build}
+        local build_config=${2:-}
+
+        local job_count=
+        if [ "$(uname)" = 'Darwin' ]; then
+          job_count=$(sysctl -n hw.physicalcpu)
+        else
+          job_count=$(nproc)
+        fi
+
+        if [ -z "$build_config" ]; then
+          cmake --build "$build_dir" -j "$job_count"
+        else
+          cmake --build "$build_dir" -j "$job_count" --config "$build_config"
+        fi
+      }
+
+      st_build_cmake_install() {
+        local build_dir=${1:-build}
+
+        cmake --build "$build_dir" --target install
+      }
+
+      st_build_gradle_add_property() {
+        local name=${1:?Missing argument \`\$1 - name\` when calling st_build_gradle_add_property.}
+        local value=${2:?Missing argument \`\$2 - value\` when calling st_build_gradle_add_property.}
+
+        local gradle_user_home=${GRADLE_USER_HOME:-$HOME/.gradle}
+        mkdir -p "$gradle_user_home"
+
+        local gradle_property_file="$gradle_user_home/gradle.properties"
+        touch "$gradle_property_file"
+
+        if (grep -Eq "$name=" "$gradle_property_file"); then
+          sed -i --follow-symlinks "s/.*$name=.*/$name=$value/g" "$gradle_property_file"
+        else
+          echo "$name=$value" >>"$gradle_property_file"
+        fi
+      }
+
+      st_build_android_gradle_build() {
+        local project_dir=${1:-.}
+        local out_dir=${2:-out}
+        local build_task=${3:-assemble}
+        local gradle_project_dir=${4:-}
+        local gen_mapping_and_symbols=${5:-false}
+
+        gradle_project_dir=$(echo "$gradle_project_dir" | sed -E 's/^(\.$|\.\/+)//g')
+        local gradle_project_dir_rel_to_run_dir="$project_dir$([ -n "$gradle_project_dir" ] && echo "/$gradle_project_dir")"
+        sh "$project_dir/gradlew" --parallel -p "$gradle_project_dir_rel_to_run_dir" "$build_task"
+
+        local file_map=
+        check_same_name() {
+          local generated_file=${1:?Missing argument \`\$1 - generated_file\` when calling check_same_name.}
+          local output_file=${2:?Missing argument \`\$2 - output_file\` when calling check_same_name.}
+
+          echo "$output_file:$generated_file"
+
+          local existing
+          existing=$(echo "$file_map" | (grep -E "^$output_file:" || true) | awk -F ':' '{print $2}')
+          if [ -n "$existing" ]; then
+            st_log_error "Built a file with the same name(\`$(echo "$output_file" | sed -E 's/\-(debug|release)\.(apk|aab|jar)/\.\2'/g)\`) in different gradle tasks."
+            return 1
+          fi
+
+          file_map="$file_map
+      $output_file:$generated_file"
+        }
+
+        local old_ifs=$IFS
+        IFS=$'\n'
+        local artifact
+        for artifact in $(
+          find "$gradle_project_dir_rel_to_run_dir" \
+            -name '*\.apk' -o -name '*\.aab' -o -name '*\.jar' |
+            grep -E '/build/(outputs/(apk|bundle)/|libs/.*jar)' || true
+        ); do
+          IFS=$old_ifs
+
+          check_same_name "$artifact" "$(basename "$artifact" | sed -E 's/-release\.(apk|aab|jar)$/\.\1/g')"
+
+          if (echo "$artifact" | grep -qE '\-debug\.(apk|aab|jar)'); then
+            mkdir -p "$out_dir/debug"
+            mv "$artifact" "$out_dir/debug"
+            continue
+          fi
+
+          mkdir -p "$out_dir/release"
+
+          if [ "$gen_mapping_and_symbols" == 'true' ]; then
+            local variant
+            variant=$(echo "$artifact" | awk -F '/build/outputs/apk/' '{print $2}' | awk -F '/' '{print $1}')
+            if [ "$variant" != "release" ]; then
+              variant="${variant}Release"
+            fi
+
+            local module_path
+            module_path=$(echo "$artifact" | sed -E 's/(.*)\/build\/(outputs|libs)\/.*/\1/g')
+
+            if [ -d "$module_path/build/outputs/mapping/$variant" ]; then
+              local filename
+              filename=$(basename "$artifact" | sed -E 's/(\-release)?.(apk|aab|jar)$//g')
+
+              tar czvf "$out_dir/release/$filename-mapping.tar.gz" \
+                -C "$module_path/build/outputs/mapping/$variant" \
+                $(ls "$module_path/build/outputs/mapping/$variant")
+
+              if [ -f "$module_path/build/outputs/native-debug-symbols/$variant/native-debug-symbols.zip" ]; then
+                mv "$module_path/build/outputs/native-debug-symbols/$variant/native-debug-symbols.zip" \
+                  "$out_dir/release/$filename-native-debug-symbols.zip"
+              fi
+            fi
+          fi
+
+          mv "$artifact" "$out_dir/release/$(basename "$artifact" | sed -E 's/-release\.(apk|aab|jar)$/\.\1/g')"
+          continue
+        done
+
+        unset check_same_name
+      }
+
+      st_build_gradle_lint() {
+        local project_dir=${1:-.}
+        local out_dir=${2:-out}
+        local gradle_sub_project=${3:-}
+        local gradle_project_dir=${4:-}
+
+        gradle_sub_project=$(echo "$gradle_sub_project" | sed -E 's/^:*/:/g' | sed -E 's/:*$//g')
+        gradle_project_dir=$(echo "$gradle_project_dir" | sed -E 's/^(\.$|\.\/+)//g')
+        local gradle_project_dir_rel_to_run_dir="$project_dir$([ -n "$gradle_project_dir" ] && echo "/$gradle_project_dir")"
+
+        local gradle_sub_projects_to_lint=
+        if [ -z "$gradle_sub_project" ]; then
+          gradle_sub_projects_to_lint=$(
+            sh "$project_dir/gradlew" -p "$gradle_project_dir_rel_to_run_dir" projects |
+              (grep -E ' *.?--- Project ' || true) |
+              sed -E 's/.*--- Project //g' |
+              awk -F "'" '{print $2}' |
+              sort |
+              uniq
+          )
+
+          # `$gradle_sub_projects_to_lint` has no value when `$gradle_project_dir` has no sub-projects.
+        fi
+
+        if [ -z "$gradle_sub_projects_to_lint" ]; then
+          gradle_sub_projects_to_lint=$(
+            echo "$gradle_sub_project" &&
+              sh "$project_dir/gradlew" -p "$gradle_project_dir_rel_to_run_dir" "$([ -n "$gradle_sub_project" ] && echo "$gradle_sub_project":)"dependencies |
+                (grep -E ' *\.?--- project ' || true) |
+                sed -E 's/.*--- project //g' |
+                (grep -Ev ' (\(.?\)|FAILED)$' || true) |
+                sed -E '/^$/d' |
+                sort | uniq
+          )
+        fi
+
+        if [ -z "$gradle_sub_projects_to_lint" ]; then
+          st_log_error "No lintable gradle sub-projects found."
+          return 1
+        fi
+
+        local reports_dir="$project_dir/build/reports/$(date +%s | md5sum | awk '{print $1}' | cut -c 1-7)"
+        local lint_results_dir="$reports_dir/lint-results"
+        mkdir -p "$lint_results_dir"
+
+        local gradle_sub_project_to_lint
+        local result_summary=
+        local lint_result_files=
+        local ret
+        let ret=0 || :
+
+        for gradle_sub_project_to_lint in $gradle_sub_projects_to_lint; do
+          local module_dir="$(echo "$gradle_sub_project_to_lint" | sed -E 's/:/\//g' | sed -E 's/^\///g')"
+
+          if ! ([ -f "$project_dir/$module_dir/build.gradle" ] || [ -f "$project_dir/$module_dir/build.gradle.kts" ]); then
+            continue
+          fi
+
+          echo "Execute lint task for \`$gradle_sub_project_to_lint\`."
+          if sh "$project_dir/gradlew" --parallel -p "$gradle_project_dir_rel_to_run_dir" "$gradle_sub_project_to_lint":lintRelease; then
+            result_summary="$result_summary
+      $gradle_sub_project_to_lint --- pass"
+          else
+            if ! [ -f "$project_dir/$module_dir/build/reports/lint-results-release.html" ]; then
+              result_summary="$result_summary
+      $gradle_sub_project_to_lint --- fail(build)"
+              continue
+            fi
+
+            result_summary="$result_summary
+      $gradle_sub_project_to_lint --- fail"
+            let ret=1
+          fi
+
+          local dest_filename="$(echo "$module_dir" | sed -E 's/\//-/g')-lint-results.html"
+          cp "$project_dir/$module_dir/build/reports/lint-results-release.html" "$lint_results_dir/$dest_filename"
+          lint_result_files="$lint_result_files
+      lint-results/$dest_filename"
+        done
+
+        echo "$result_summary" | column -t | tee "$reports_dir/lint-result-summary.txt"
+
+        local filename_prefix
+        if [ -n "$gradle_sub_project" ]; then
+          filename_prefix="$(echo "$gradle_sub_project" | sed -E 's/:+/-/g' | sed -E 's/^-+//g')-"
+        elif [ -n "$gradle_project_dir" ]; then
+          filename_prefix="$(echo "$gradle_project_dir" | sed -E 's/\//-/g' | sed -E 's/\-+$//g')-"
+        else
+          filename_prefix=
+        fi
+
+        mkdir -p "$out_dir"
+        echo "lint-result-summary.txt
+      $lint_result_files" | tar -C "$reports_dir" -czvf "$out_dir/${filename_prefix}reports-android-lint.tar.gz" --files-from -
+
+        return $ret
+      }
+
+      st_build_swift_lint() {
+        local project_dir=${1:-.}
+        local out_dir=${2:-out}
+        local config_file=${3:-}
+        local config_file_arg
+
+        if [ -n "$config_file" ]; then
+          if ! [ -f "$project_dir/$config_file" ]; then
+            st_log_error "No \`$project_dir/$config_file\` file was found."
+            return 1
+          fi
+
+          config_file_arg="--config $project_dir/$config_file"
+        else
+          config_file=".swiftlint.yml"
+
+          if [ -f "$project_dir/$config_file" ]; then
+            config_file_arg="--config $project_dir/$config_file"
+          else
+            st_log_warn "It is recommended to add a \`$project_dir/.swiftlint.yml\` file."
+            config_file_arg=
+          fi
+        fi
+
+        mkdir -p "$out_dir"
+        swiftlint lint $config_file_arg --reporter "html" --no-cache --strict "$project_dir" >"$out_dir/swift-lint-results.html"
+      }
+
+      st_build_xcode_build() {
+        local project_dir=${1:-.}
+        local out_dir=${2:-out}
+        local xcodegen_yml=${3:-project.yml}
+        local scheme=${4:-}
+        local file_filter_regex=${5:-.*}
+        local export_for_app_store=${6:-false}
+
+        local xcodeproj_name
+        xcodeproj_name=$(cat "$project_dir/$xcodegen_yml" | (grep -Eo '^ *name: *[0-9a-zA-Z_\-]+ *$' || true) | awk -F ' ' '{print $2}')
+        if [ -z "$xcodeproj_name" ]; then
+          st_log_error "Illegal xcodeproj name. Check your \`$$project_dir/$xcodegen_yml\` file."
+          return 1
+        fi
+
+        rm -rf "$project_dir/$xcodeproj_name.xcodeproj"
+        xcodegen --spec "$project_dir/$xcodegen_yml" --project "$project_dir"
+
+        mkdir -p "$project_dir/DerivedData-$xcodeproj_name"
+        local derived_data_path
+        derived_data_path=$(cd "$project_dir/DerivedData-$xcodeproj_name" && pwd)
+
+        if [ -z "$scheme" ]; then
+          scheme=$xcodeproj_name
+        fi
+
+        print_product_bundle_package_type() {
+          xcrun xcodebuild \
+            -derivedDataPath "$derived_data_path" \
+            -project "$project_dir/$xcodeproj_name.xcodeproj" \
+            -scheme "$scheme" \
+            -showBuildSettings 2>/dev/null |
+            (grep -Eo 'PRODUCT_BUNDLE_PACKAGE_TYPE = .*' || true)
+        }
+
+        local product_bundle_package_type
+        product_bundle_package_type=$(print_product_bundle_package_type)
+        unset print_product_bundle_package_type
+
+        mkdir -p "$out_dir/Release"
+
+        if (echo "$product_bundle_package_type" | grep -qE ' FMWK$'); then
+          xcrun xcodebuild \
+            -derivedDataPath "$derived_data_path" \
+            -project "$project_dir/$xcodeproj_name.xcodeproj" \
+            -scheme "$scheme" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' |
+            xcbeautify
+
+          local frameworks_and_bundles
+          frameworks_and_bundles=$(
+            ls -1 "$derived_data_path/Build/Products/Release-iphoneos" |
+              (grep -E "^$file_filter_regex\.(framework|bundle)$" || true)
+          )
+          if [ -z "$frameworks_and_bundles" ]; then
+            st_log_error "No frameworks or bundles found after filtering by the \`$file_filter_regex\` regex."
+            return 1
+          fi
+
+          local framework
+          local framework_name
+          local swift_header_dir
+          local swift_header_file
+          for framework in $(echo "$frameworks_and_bundles" | grep -E '\.framework$' || true); do
+            framework_name=$(echo "$framework" | sed -E 's/\.framework$//g')
+            swift_header_dir="$derived_data_path/Build/Products/Release-iphoneos/$framework/Headers"
+            swift_header_file="$derived_data_path/Build/Intermediates.noindex/$xcodeproj_name.build/Release-iphoneos/$framework_name.build/DerivedSources/$framework_name-Swift.h"
+            if (! [ -d "$swift_header_dir" ]) && [ -f "$swift_header_file" ]; then
+              mkdir -p "$swift_header_dir"
+              cp -f "$swift_header_file" "$swift_header_dir"
+            fi
+
+            echo "swift_header_dir: $swift_header_dir"
+            echo "swift_header_file: $swift_header_file"
+          done
+
+          echo "$frameworks_and_bundles" |
+            xargs tar -C "$derived_data_path/Build/Products/Release-iphoneos" -czvf "$out_dir/Release/$scheme-frameworks.tar.gz" --files-from -
+
+          ls -1 "$derived_data_path/Build/Products/Release-iphoneos" |
+            (grep -E "^$file_filter_regex\.framework.dSYM$" || true) |
+            st_compatible_xargs_i_r tar -C "$derived_data_path/Build/Products/Release-iphoneos" -czvf "$out_dir/Release/$scheme-framework-dSYMs.tar.gz" --files-from -
+
+          return $?
+        fi
+
+        if ! (echo "$product_bundle_package_type" | grep -qE ' APPL$'); then
+          st_log_error "Unsupported PRODUCT_BUNDLE_PACKAGE_TYPE: $product_bundle_package_type"
+          return 1
+        fi
+
+        mkdir -p "$derived_data_path/Archives"
+        xcrun xcodebuild \
+          -derivedDataPath "$derived_data_path" \
+          -project "$project_dir/$xcodeproj_name.xcodeproj" \
+          -scheme "$scheme" \
+          -configuration Release \
+          -destination 'generic/platform=iOS' \
+          -allowProvisioningUpdates \
+          -archivePath "$derived_data_path/Archives/$scheme.xcarchive" \
+          archive | xcbeautify
+
+        st_build_xcode_export_ipa() {
+          local xcarchive_file=${1:?Missing argument \`\$1 - xcarchive_file\` when calling st_build_xcode_export_ipa.}
+          local export_method=${2:?Missing argument \`\$2 - export_method\` when calling st_build_xcode_export_ipa.} # xcodebuild --help
+
+          local plist_file="$derived_data_path/Archives/ExportOptions-$export_method.plist"
+          cat >"$plist_file" <<EOF
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      <plist version="1.0">
+        <dict>
+          <key>method</key>
+          <string>$export_method</string>
+        </dict>
+      </plist>
+      EOF
+
+          rm -rf "$derived_data_path/Archives/ExportedIpa-$export_method"
+          xcrun xcodebuild \
+            -exportArchive \
+            -exportOptionsPlist "$plist_file" \
+            -allowProvisioningUpdates \
+            -archivePath "$xcarchive_file" \
+            -exportPath "$derived_data_path/Archives/ExportedIpa-$export_method" |
+            xcbeautify
+          mv "$derived_data_path/Archives/ExportedIpa-$export_method"/*.ipa "$out_dir/Release/$scheme-$(echo "$export_method" | sed 's/-/_/g').ipa"
+        }
+
+        tar -C "$derived_data_path/Archives/$scheme.xcarchive/dSYMs" -czvf "$out_dir/Release/$scheme.app.dSYM.tar.gz" $scheme.app.dSYM
+
+        st_build_xcode_export_ipa "$derived_data_path/Archives/$scheme.xcarchive" 'development'
+        if [ "$export_for_app_store" = 'true' ]; then
+          st_build_xcode_export_ipa "$derived_data_path/Archives/$scheme.xcarchive" 'app-store'
+        fi
+
+        unset st_build_xcode_export_ipa
+      }
+
+      st_build_xcode_clean() {
+        local project_dir=${1:-.}
+        local clean_cache=${2:-false}
+
+        local derived_data
+        for derived_data in $(ls -1 "$project_dir" | (grep -E 'DerivedData.*' || true)); do
+          if [ "$clean_cache" = 'true' ]; then
+            rm -rf "$project_dir/$derived_data"
+          else
+            rm -rf "$project_dir/$derived_data/Build"
+            rm -rf "$project_dir/$derived_data/Logs"
+            rm -rf "$project_dir/$derived_data/info.plist"
+            rm -rf "$project_dir/$derived_data/Archives"
+            rm -rf "$project_dir/$derived_data/Frameworks"
+          fi
+        done
+      }
+
+      st_build_upload_ios_app_to_app_store_connect() {
+        local app_path=${1:?Missing argument \`\$1 - app_path\` when calling st_build_upload_ios_app_to_app_store_connect.}
+        local username=${2:?Missing argument \`\$3 - username\` when calling st_build_upload_ios_app_to_app_store_connect.}
+
+        # protect `password`
+        local print_commands
+        print_commands=$(if echo "$-" | grep -q 'x'; then echo 'true'; fi)
+        if [ -n "$print_commands" ]; then set +x; fi
+
+        # About passowrd: https://support.apple.com/zh-cn/HT204397
+        local password=${3:?Missing argument \`\$3 - password\` when calling st_build_upload_ios_app_to_app_store_connect.}
+
+        xcrun altool --upload-app -f "$app_path" -t ios -u "$username" -p "$password"
+
+        if [ -n "$print_commands" ]; then set -x; fi
+      }
+
+      st_build_read_change_log_of_version() {
+        local change_log_file=${1:?Missing argument \`\$1 - change_log_file\` when calling st_build_read_change_log_of_version.}
+        local version=${2:?Missing argument \`\$3 - version\` when calling st_build_read_change_log_of_version.}
+
+        local output
+        if output=$(sed -nE "/## $version/,/^## .*$st_build_semver_regex/p" "$change_log_file" | (grep -vE "## .*$st_build_semver_regex" || true) | sed '/./,/^$/!d') && [ -n "$output" ]; then
+          echo "## $version - $(date +%D)
+
+      $output"
+          return 0
+        fi
+
+        st_log_error "\`$change_log_file\` an invalid CHANGELOG markdown file.
+      See the following template.
+
+      \`\`\`md
+      ## 1.1.0
+
+      ### 特性
+
+      1. 新增 x 功能
+      1. 新增 y 功能
+
+      ### 改进
+
+      1. 吞吐提高 x%
+      1. 延时降低 y%
+
+      ### 问题修复
+
+      1. 修复 x 问题
+      1. 修复 x 问题
+
+      ## 1.0.0
+
+      ### 特性
+
+      1. 新增 x 功能
+      1. 新增 y 功能
+
+      ### 改进
+
+      1. 吞吐提高 x%
+      1. 延时降低 y%
+
+      ### 问题修复
+
+      1. 修复 x 问题
+      1. 修复 x 问题
+
+      \`\`\`
+
+      Note: Choose the right header. ## for version, and ### for 特性(Features)/改进(Improvement)/问题修复(Bug fixes)
+      "
+      }
+
+      # module: compatible
+      if [ "$(uname)" = 'Darwin' ]; then
+        st_compatible_xargs_i_r() {
+          xargs -I {} sh -c "[ -n {} ] && $*"
+        }
+      else
+        st_compatible_xargs_i_r() {
+          xargs -ri sh -c "$*"
+        }
+      fi
+
+      # module: fs
+      st_fs_get_cache_dir() {
+        local bin_name=${1:?Missing argument \`\$1 - bin_name\` when calling st_fs_get_cache_dir.}
+
+        local cache_dir="$HOME/.cache/sh-toolbox/$bin_name"
+        echo "$cache_dir"
+
+        mkdir -p "$cache_dir"
+      }
+
+      st_fs_file_lock() {
+        local path=${1:?Missing argument \`\$1 - path\` when calling st_fs_file_lock.}
+        local fd=${2:?Missing argument \`\$1 - path\` when calling st_fs_file_lock.}
+        local block=${3:-}
+
+        mkdir -p "$(dirname "$path")"
+        eval "exec $fd> \"$path\""
+
+        local block_arg=
+        if [ -z "$block" ]; then
+          block_arg="-n"
+        fi
+
+        if ! flock $block_arg $fd; then
+          return 1
+        fi
+
+        eval "echo $$ 1>&$fd"
+      }
+
+      st_fs_install_command() {
+        local command_dir=${1:?Missing argument \`\$1 - command_dir\` when calling st_fs_install_command.}
+        local command_url=${2:?Missing argument \`\$2 - command_url\` when calling st_fs_install_command.}
+        local command_name=${3:?Missing argument \`\$3 - command_name\` when calling st_fs_install_command.}
+
+        st_fs_download_file "$command_url" "$command_dir" "$command_name"
+
+        local command_abs_dir
+        command_abs_dir=$(cd -- "$command_dir" && pwd)
+        chmod +x "$command_abs_dir/$command_name"
+
+        if ! (echo "$PATH" | grep -Eq "$command_abs_dir"); then
+          export PATH="$command_abs_dir:$PATH"
+        fi
+      }
+
+      st_gitlab_install_command() {
+        local gitlab_raw_file_url=${1:?Missing argument \`\$1 - gitlab_raw_file_url\` when calling st_gitlab_install_command.}
+        local command_dir=${2:?Missing argument \`\$2 - command_dir\` when calling st_gitlab_install_command.}
+        local command_name=${3:?Missing argument \`\$3 - command_name\` when calling st_gitlab_install_command.}
+        local gitlab_api_v4_url=${4:?Missing argument \`\$4 - gitlab_api_v4_url\` when calling st_gitlab_install_command.}
+        local gitlab_token=${5:?Missing argument \`\$5 - gitlab_token\` when calling st_gitlab_install_command.}
+
+        local project
+        project=$(echo "$gitlab_raw_file_url" | awk -F '/-/raw/' '{print $1}' | sed -E 's/^https?:\/\/[a-z\.]+\///g')
+        local file_path
+        file_path=$(echo "$gitlab_raw_file_url" | awk -F '/-/raw/' '{print $NF}')
+        local ref
+        ref=$(dirname "$file_path")
+        file_path=$(basename "$file_path")
+
+        mkdir -p "$command_dir"
+        curl \
+          --progress-bar \
+          --header "PRIVATE-TOKEN: $gitlab_token" \
+          --output "$command_dir/$command_name" \
+          "$gitlab_api_v4_url/projects/$(echo "$project" | sed -E 's/\//%2F/g')/repository/files/$(echo "$file_path" | sed -E 's/\//%2F/g')/raw?ref=$ref"
+
+        local command_abs_dir
+        command_abs_dir=$(cd -- "$command_dir" && pwd)
+        chmod +x "$command_abs_dir/$command_name"
+
+        if ! (echo "$PATH" | grep -Eq "$command_abs_dir"); then
+          export PATH="$command_abs_dir:$PATH"
+        fi
+      }
+
+      st_fs_download_file() {
+        local url=${1:?Missing argument \`\$1 - url\` when calling st_fs_download_file.}
+        local directory=${2:?Missing argument \`\$2 - directory\` when calling st_fs_download_file.}
+        local filename=${3:?Missing argument \`\$3 - filename\` when calling st_fs_download_file.}
+
+        mkdir -p "$directory"
+        local abs_dir
+        abs_dir=$(cd -- "$directory" && pwd)
+
+        if (which curl >&/dev/null); then
+          curl -L "$url" -o "$abs_dir/$filename"
+        elif (which wget >&/dev/null); then
+          wget "$url" -O "$abs_dir/$filename"
+        else
+          st_log_error "wget or curl not found when calling st_fs_download_file."
+          return 1
+        fi
+      }
+
+      st_fs_add_host() {
+        local domain=${1:?Missing argument \`\$1 - domain\` when calling st_fs_add_host.}
+        local ip=${2:?Missing argument \`\$2 - ip\` when calling st_fs_add_host.}
+
+        if (grep -Eq "$domain" /etc/hosts); then
+          echo "$(sed "s/.*$domain/$ip $domain/g" /etc/hosts)" >/etc/hosts # if you use `sed -i ...` directly, it will fail and prompt: sed: can't move '/etc/hosts...' to '/etc/hosts': Resource busy.
+        else
+          echo "$ip $domain" >>/etc/hosts
+        fi
+      }
+
+      st_fs_read_string_from_text_file() {
+        local text_file=${1:?Missing argument \`\$1 - text_file\` when calling st_fs_read_string_from_text_file.}
+        local string_regex=${2:?Missing argument \`\$2 - string_regex\` when calling st_fs_read_string_from_text_file.}
+        local line_regex=${3-.*}
+
+        grep -E "$line_regex" "$text_file" | grep -Eo "$string_regex"
+      }
+
+      st_fs_write_string_into_text_file() {
+        local text_file=${1:?Missing argument \`\$1 - text_file\` when calling st_fs_write_string_into_text_file.}
+        local string_content=${2:?Missing argument \`\$2 - string_content\` when calling st_fs_write_string_into_text_file.}
+        local string_regex=${3:?Missing argument \`\$3 - string_regex\` when calling st_fs_write_string_into_text_file.}
+        local line_regex=${4-.*}
+
+        if [ "$(uname)" = 'Darwin' ]; then
+          if [ -L "$text_file" ]; then
+            sed -Ei '' "/$line_regex/s/$string_regex/$string_content/g" "$(readlink -f $text_file)"
+          else
+            sed -Ei '' "/$line_regex/s/$string_regex/$string_content/g" "$text_file"
+          fi
+        else
+          sed -Ei --follow-symlinks "/$line_regex/s/$string_regex/$string_content/g" "$text_file"
+        fi
+      }
+
+      # module: git
+      st_git_config_user_name_email() {
+        local user_name=${1:?Missing argument \`\$1 - user_name\` when calling st_git_config_user_name_email.}
+        local user_email=${2:?Missing argument \`\$2 - user_email\` when calling st_git_config_user_name_email.}
+
+        git config --global user.name "$user_name"
+        git config --global user.email "$user_email"
+      }
+
+      st_git_config_color_ui() {
+        local color_option=${1:-auto}
+        if !(echo "$color_option" | grep -E '(always|auto|false|never|no|off|on|true|yes)'); then
+          st_log_error "Illegal argument \`\$1 - color_option\`($color_option) when calling st_git_config_color_ui. Should be one of always|auto|false|never|no|off|on|true|yes."
+          return 1
+        fi
+
+        git config --global color.ui "$color_option"
+      }
+
+      st_git_clone() {
+        local repository=${1:?Missing argument \`\$1 - repository\` when calling st_git_clone.}
+        local ref_or_commit=${2:-}
+        local directory=${3:-$(basename "$repository" | sed 's|\.git$||g')}
+        local depth=${4:-}
+
+        if [ -n "$depth" ] && (!(st_number_is_int "$depth") || [ $depth -le 0 ]); then
+          st_log_error "Illegal argument \`\$4 - depth\` (should: int, > 0) when calling st_git_clone."
+          return 1
+        fi
+
+        git init "$directory"
+        cd "$directory" # cd {
+
+        git remote remove origin 2>/dev/null || true
+        git remote add origin "$repository"
+
+        if [ -z "$ref_or_commit" ]; then
+          ref_or_commit=$(git remote show origin | grep -E 'HEAD branch:' | awk -F ': ' '{print $NF}')
+        fi
+
+        local depth_arg="$([ -n "$depth" ] && echo "--depth=$depth")"
+        git fetch --progress $depth_arg origin $ref_or_commit
+        git reset --hard FETCH_HEAD
+
+        cd $OLDPWD # } cd
+      }
+
+      st_git_info() {
+        local repo_root=${1:-.}
+        cd "$repo_root" # cd {
+
+        echo "Repo Url: $(git remote get-url origin)
+      Commit Id: $(git rev-parse HEAD)
+      Author: $(git log --format='%an <%ae>' -1)
+      Date: $(git log --format='%ad' -1)"
+
+        local tags
+        tags=$(git tag --points-at HEAD | xargs echo | sed 's/ /, /g')
+        if [ -n "$tags" ]; then
+          echo "Tags: $tags"
+        fi
+
+        cd $OLDPWD # } cd
+      }
+
+      # module: log
+      st_log_no_color=${st_log_no_color:-}
+
+      st_log_debug() {
+        if [ -n "$st_log_no_color" ]; then
+          printf "[debug] $*\n"
+        else
+          printf "\033[90m[debug]\033[0m $*\n"
+        fi
+      }
+
+      st_log_info() {
+        printf "$*\n"
+      }
+
+      st_log_warn() {
+        if [ -n "$st_log_no_color" ]; then
+          printf >&2 "[warn] $*\n"
+        else
+          printf >&2 "\033[93m[warn]\033[0m $*\n"
+        fi
+      }
+
+      st_log_error() {
+        if [ -n "$st_log_no_color" ]; then
+          printf >&2 "[error] $*\n"
+        else
+          printf >&2 "\033[91m[error]\033[0m $*\n"
+        fi
+      }
+
+      st_log_fatal() {
+        if [ -n "$st_log_no_color" ]; then
+          printf >&2 "[fatal] $*\n"
+        else
+          printf >&2 "\033[101m[fatal]\033[0m $*\n"
+        fi
+      }
+
+      # module: number
+      st_number_is_int() {
+        local input=${1:-}
+        printf %d "$input" >&/dev/null
+      }
+
+      # module: repo
+      st_repo_init_and_sync() {
+        local manifest_url=${1:?Missing argument \`\$1 - manifest_url\` when calling st_repo_init_and_sync.}
+        local ref_or_commit=${2:-}
+        local directory=${3:-$(basename "$manifest_url" | sed 's|\.git$||g')}
+        local depth=${4:-}
+        local manifest_name=${5:-}
+
+        if [ -n "$depth" ] && (!(st_number_is_int "$depth") || [ $depth -le 0 ]); then
+          st_log_error "Illegal argument \`\$4 - depth\` (should: int, > 0) when calling st_repo_init_and_sync."
+          return 1
+        fi
+
+        local available_ref_or_commit=$ref_or_commit
+        if [ -n "$ref_or_commit" ] && (git ls-remote "$manifest_url" | grep -qE "refs/tags/$ref_or_commit$"); then
+          available_ref_or_commit=$(git ls-remote "$manifest_url" | (grep -E "refs/tags/$ref_or_commit$" || true) | awk '{print $1}')
+          st_log_info "\`repo init\` with \`-b $available_ref_or_commit\`(tag: $ref_or_commit)"
+        fi
+
+        mkdir -p "$directory"
+        cd "$directory" # cd {
+
+        local manifest_branch_arg
+        manifest_branch_arg=$(if [ -n "$available_ref_or_commit" ]; then echo "-b $available_ref_or_commit"; fi)
+        local depth_arg
+        depth_arg=$(if [ -n "$depth" ]; then echo "--depth $depth"; fi)
+        local manifest_name_arg
+        manifest_name_arg=$(if [ -n "$manifest_name" ]; then echo "-m $manifest_name"; fi)
+
+        repo init -u "$manifest_url" $manifest_branch_arg $depth_arg $manifest_name_arg
+        repo forall --ignore-missing -ve -c sh -c 'pwd && git checkout . && git clean -df' # when no sh -c ..., this command may fail on windows & macOS.
+        if [ "$(uname)" = 'Darwin' ]; then
+          repo sync -d --force-sync --force-remove-dirty --prune -j $(sysctl -n hw.physicalcpu)
+        else
+          repo sync -d --force-sync --force-remove-dirty --prune -j $(nproc)
+        fi
+
+        cd $OLDPWD # } cd
+      }
+
+      st_repo_info() {
+        local repo_root=${1:-.}
+        cd "$repo_root" # cd {
+
+        if (uname | grep -qE '^MINGW'); then
+          local drive_symbol
+          drive_symbol=$(repo info | grep -oE 'path: +[A-Z]:' | grep -oE '[A-Z]' | uniq | head -n 1 | tr A-Z a-z)
+          repo info | sed -E "s/path: +[A-Z]:/path: \/$drive_symbol/g" | sed -E -e '\|Local Branches|d' -e "s|$PWD/||g" -e 's|\x1B\[[0-9;]*[JKmsu]||g'
+        else
+          repo info | sed -E -e '\|Local Branches|d' -e "s|$PWD/||g" -e 's|\x1B\[[0-9;]*[JKmsu]||g'
+        fi
+
+        cd $OLDPWD # } cd
+      }
+
+      # module: ssh
+      st_ssh_write_private_key() {
+        local key_type=${2:-rsa} # dsa | ecdsa | ed25519 | rsa
+        local key_filename=${3:-id_${key_type}}
+
+        # protect `key_content`
+        local print_commands
+        print_commands=$(if echo "$-" | grep -q 'x'; then echo 'true'; fi)
+        if [ -n "$print_commands" ]; then set +x; fi
+
+        local key_content=${1:?Missing argument \`\$1 - key_content\` when calling st_ssh_write_private_key.}
+
+        mkdir -p $HOME/.ssh
+        chmod 700 $HOME/.ssh
+
+        if ! (echo "$key_content" | grep -Eq -- '-----BEGIN'); then
+          local decoded_content="$(echo "$key_content" | base64 -d 2>/dev/null)"
+
+          if ! (echo "$decoded_content" | grep -Eq -- '-----BEGIN'); then
+            st_log_error "Invalid ssh private key content."
+            if [ -n "$print_commands" ]; then set -x; fi
+            return 1
+          fi
+
+          key_content="$decoded_content"
+        fi
+
+        local key_file="$HOME/.ssh/${key_filename}"
+        if [ -f "$key_file" ]; then
+          mv "$key_file" "${key_file}.backup.$(date +%s)"
+        fi
+
+        echo "$key_content" >"$key_file"
+        chmod 600 "$key_file"
+
+        if [ -n "$print_commands" ]; then set -x; fi
+      }
+
+      st_ssh_write_common_config_for_all_hosts() {
+        mkdir -p "$HOME/.ssh"
+        chmod 700 "$HOME/.ssh"
+
+        echo "HOST *
+        StrictHostKeyChecking no
+        UserKnownHostsFile /dev/null
+        LogLevel ERROR" >"$HOME/.ssh/config"
+        chmod 600 "$HOME/.ssh/config"
+      }
+
+      # start here
+      env | grep -E '^PCI_' || true
+
+      export TZ='Asia/Shanghai'
+
+      # Cleanup `tmp` & `artifact` directories
+      (
+        echo '.ci-tmp' \
+        && \
+        (
+          [ -d "." ] \
+          && (
+            ls -1 "." \
+            | (grep -iE '^([dD]ebug|[rR]elease|[rR]eports|.*repo-info\.txt|.*head-manifest\.xml|.*sha256sum\.txt|__args__)$' || true)
+          ) | st_compatible_xargs_i_r echo "./{}"
+        )
+      ) | st_compatible_xargs_i_r rm -rf "{}"
+
+      st_ssh_write_common_config_for_all_hosts
+      st_ssh_write_private_key "$machine_user_ssh_private_key" "ed25519" ""
+
+      # hosts for google
+      st_fs_add_host "dl-ssl.google.com" "203.208.40.33"
+      st_fs_add_host "dl.google.com" "203.208.40.33"
+      st_fs_add_host "www.google.com" "203.208.40.33"
+
+      st_git_config_color_ui "on"
+      st_git_config_user_name_email "Machine" "machine@ci"
+
+      st_gitlab_install_command \
+        "https://gitlab.ubtrobot.com/rosa-dev/git-repo/-/raw/stable/repo" \
+        ".ci-tmp/bin" \
+        "repo" \
+        "$CI_API_V4_URL" \
+        "$machine_user_gitlab_token"
+      export REPO_URL="git@gitlab.ubtrobot.com:rosa-dev/git-repo.git"
+
+      st_repo_init_and_sync "$(echo "$CI_REPOSITORY_URL" | sed -E 's/^.*gitlab\.ubtrobot\.com\//git@gitlab.ubtrobot.com:/g')" "$CI_COMMIT_REF_NAME" "." "1" "$([ -n "$CI_COMMIT_TAG" ] && echo "$CI_COMMIT_TAG".xml)"
+      st_repo_info "." | tee "repo-info.txt"
+      repo manifest -r | tee "head-manifest.xml"
+
+      export GRADLE_USER_HOME="$PWD/.ci-tmp/gradle"
+      mkdir -p "$GRADLE_USER_HOME"
+      mkdir -p ".ci-cache/"{jdks,wrapper,caches}
+      ln -sfr ".ci-cache"/{jdks,wrapper,caches} ".ci-tmp/gradle"
+
+      st_build_gradle_add_property "gitlab_maven_url" "https://gitlab.ubtrobot.com/api/v4/projects/344/packages/maven"
+      st_build_gradle_add_property "gitlab_token" "$machine_user_gitlab_token"
+
+      st_build_check_semver_in_text_file "build.gradle.kts" 'extra\["stalco-version"\]'
+      g_version=$(st_build_read_semver_from_text_file "build.gradle.kts" 'extra\["stalco-version"\]')
+      echo "Version: $g_version"
+
+      st_build_prepare_build_numbers_repo "git@gitlab.ubtrobot.com:rosa/productivity/ci/build-numbers.git" "products/lawnmower/android" ".ci-tmp/build-numbers"
+      g_build_number=$(st_build_cal_incremental_build_number ".ci-tmp/build-numbers")
+      echo "Build Number: $g_build_number"
+
+      st_fs_write_string_into_text_file "build.gradle.kts" "$g_build_number" "[0-9]+" 'extra\["version-code"\]'
+
+      g_backend_env_regex="PRODUCTION|PRE_RELEASE|TEST"
+      case $PCI_BACKEND_ENV in
+      PRODUCTION)
+        st_fs_write_string_into_text_file "lawnmower/app/build.gradle.kts" "PRODUCTION" "($g_backend_env_regex)" 'com\.ubtrobot\.infrastructure\.BackendEnvConf\.Env\.(PRODUCTION|PRE_RELEASE|TEST)'
+        ;;
+      PRE_RELEASE)
+        st_fs_write_string_into_text_file "lawnmower/app/build.gradle.kts" "PRE_RELEASE" "($g_backend_env_regex)" 'com\.ubtrobot\.infrastructure\.BackendEnvConf\.Env\.(PRODUCTION|PRE_RELEASE|TEST)'
+        ;;
+      TEST)
+        st_fs_write_string_into_text_file "lawnmower/app/build.gradle.kts" "TEST" "($g_backend_env_regex)" 'com\.ubtrobot\.infrastructure\.BackendEnvConf\.Env\.(PRODUCTION|PRE_RELEASE|TEST)'
+        ;;
+      *)
+        st_log_error "\`$PCI_BACKEND_ENV\` is not a legal value. Chose frome \`$g_backend_env_regex\`."
+        ;;
+      esac
+
+      repo diff
+      
+      g_gradle_tasks=
+      if [ "$PCI_BUILD_TYPE" = 'RELEASE' ]; then
+        g_gradle_tasks="
+        assembleRelease
+        bundleRelease
+        "
+      else
+        g_gradle_tasks="
+        assembleDebug
+        bundleDebug
+        "
+      fi
+
+      for g_gradle_task in $g_gradle_tasks; do
+        if (echo "$g_gradle_task" | grep -qE ':?bundle.*$'); then
+          if [ "$PCI_AAB" != 'true' ]; then
+            continue
+          fi
+
+          st_log_info "Change the keystore(aab) for \`ROSA GU\`(KeyAlias)."
+          cat > "./gradle-shared/keystores/keystore.properties" <<EOF
+      keyAlias=ROSA GU
+      storePassword=$(echo "$rosa_android_gu_jks_store_password" | base64 -d -)
+      keyPassword=$(echo "$rosa_android_gu_jks_store_password" | base64 -d -)
+      EOF
+
+          echo "$rosa_android_gu_jks" | base64 -d - > "./gradle-shared/keystores/keystore.jks"
+          cp "./gradle-shared/keystores/keystore.jks" "./gradle-shared/keystores/for-aab-encrypting.jks"
+        else
+          st_log_info "Change the keystore for \`ROSA\`(KeyAlias)."
+          cat > "./gradle-shared/keystores/keystore.properties" <<EOF
+      keyAlias=ROSA
+      storePassword=$(echo "$rosa_android_jks_store_password" | base64 -d -)
+      keyPassword=$(echo "$rosa_android_jks_store_password" | base64 -d -)
+      EOF
+
+          echo "$rosa_android_jks" | base64 -d - > "./gradle-shared/keystores/keystore.jks"
+          cp "./gradle-shared/keystores/keystore.jks" "./gradle-shared/keystores/for-apk-encrypting.jks"
+        fi
+
+        st_build_android_gradle_build "." "." "$g_gradle_task" "lawnmower/app" true
+      done
+
+      if [ "$PCI_IJIAMI_ENCRYPT" = 'true' ]; then
+        st_gitlab_install_command \
+          'https://gitlab.ubtrobot.com/rosa-dev/external-tools/-/raw/ijiami/encryptiontool/encryptionTool-v4.3.2-202308/encryptionTool-v4.3.2-202308.jar' \
+          '.ci-tmp/encrypt' \
+          'encryption-tool.jar' \
+          "$CI_API_V4_URL" \
+          "$machine_user_gitlab_token"
+        g_encryption_tool='.ci-tmp/encrypt/encryption-tool.jar'
+
+      encrypt_apk_by_ijiami() {
+          local input_apk=$1
+          local output_dir=$2
+          local plan_id=$3
+
+          java -jar "$g_encryption_tool" \
+            -t apk \
+            -u "http://10.10.84.27/common" \
+            -r "ubtech" \
+            -w "$ijiami_aab_service_password" \
+            -k "$input_apk" \
+            -s "$plan_id" \
+            -d ".ci-tmp/encrypt"
+
+          # See https://developer.android.com/studio/build/building-cmdline#sign_cmdline
+          local encrypted_unsigned_apk=".ci-tmp/encrypt/$(basename "$input_apk" | sed -E 's/\.(apk)$/_unsigned.\1/g')"
+          local encrypted_unsigned_aligned_apk=$(echo "$encrypted_unsigned_apk" | sed -E 's/\.(apk)$/_aligned.\1/g')
+
+          $ANDROID_SDK_ROOT/build-tools/$(ls -1 $ANDROID_SDK_ROOT/build-tools | tail -n 1)/zipalign -v -p 4 \
+            "$encrypted_unsigned_apk" \
+            "$encrypted_unsigned_aligned_apk"
+
+          # protect `ks-pass`
+          local print_commands=$(echo "$-" | grep 'x')
+          if [ -n "$print_commands" ]; then set +x; fi
+
+          $ANDROID_SDK_ROOT/build-tools/$(ls -1 $ANDROID_SDK_ROOT/build-tools | tail -n 1)/apksigner sign \
+            --ks "./gradle-shared/keystores/for-apk-encrypting.jks" \
+            --ks-key-alias "ROSA" \
+            --ks-pass "pass:$(echo "$rosa_android_jks_store_password" | base64 -d -)" \
+            --in "$encrypted_unsigned_aligned_apk" \
+            --out "$output_dir/$(basename "$input_apk" | sed -E 's/\.(apk)/-encrypted.\1/g')"
+
+          if [ -n "$print_commands" ]; then set -x; fi
+        }
+
+      encrypt_aab_by_ijiami() {
+          local input_aab=$1
+          local output_dir=$2
+          local plan_id=$3
+
+          java -jar "$g_encryption_tool" \
+            -t aab \
+            -u "http://10.10.84.27/common" \
+            -r "ubtech" \
+            -w "$ijiami_aab_service_password" \
+            -k "$input_aab" \
+            -s "$plan_id" \
+            -d ".ci-tmp/encrypt"
+
+          local encrypted_unsigned_aab=".ci-tmp/encrypt/$(basename "$input_aab" | sed -E 's/\.(aab)$/_encrypt.\1/g')"
+
+          # protect `storepass`
+          local print_commands=$(echo "$-" | grep 'x')
+          if [ -n "$print_commands" ]; then set +x; fi
+
+          jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
+            -storepass "$(echo "$rosa_android_gu_jks_store_password" | base64 -d -)" \
+            -keystore "./gradle-shared/keystores/for-aab-encrypting.jks" \
+            -signedjar "$output_dir/$(basename "$input_aab" | sed -E 's/\.(aab)/-encrypted.\1/g')" \
+            "$encrypted_unsigned_aab" \
+            "ROSA GU"
+
+          if [ -n "$print_commands" ]; then set -x; fi
+        }
+
+        encrypt_apk_or_aab_by_ijiami() {
+          local filename_regex=$1
+          local plan_id=$2
+
+          local app=$(
+            [ -d "." ] && \
+            (
+              find "." -maxdepth 1 -type d \
+                | (grep -E "/[rR]elease$" || true) \
+                | st_compatible_xargs_i_r " \
+                  find \"{}\" -type f \
+                    | (grep -E \"/$filename_regex$\" || true)
+                "
+            )
+          )
+
+          if [ -z "$app" ]; then
+            st_log_warn "No app to be encrypted can be found through the \`$filename_regex\` regex."
+            return 0
+          fi
+
+          if [ "$(echo -n "$app" | wc -l)" -gt 1 ]; then
+            echo "$app"
+            st_log_error "Multiple apps above to be encrypted can be found through the \`$filename_regex\` regex."
+            return 1
+          fi
+
+          if (echo "$app" | grep -E '\.apk$'); then
+            encrypt_apk_by_ijiami "$app" "$(dirname "$app")" "$plan_id"
+            return $?
+          fi
+
+          if (echo "$app" | grep -E '\.aab$'); then
+            encrypt_aab_by_ijiami "$app" "$(dirname "$app")" "$plan_id"
+            return $?
+          fi
+
+          st_log_warn "The \`$app\` app to be encrypted does not match the \`$filename_regex\` regex. Check the \`regex\` config."
+          return 1
+        }
+
+        encrypt_apk_or_aab_by_ijiami "lawn-mower-stalco\.aab" "Stalco-aab"
+      fi
+
+      g_artifact_types="apk aab apk.idsig jar aar tar.gz zip"
+
+      # rename filenames with version and build number for artifact files
+      [ -d "." ] \
+      && (
+        suffix_regex="($(echo "$g_artifact_types" | sed -E -e 's/^ +//g' -e 's/ +$//g' -e 's/ +/|/g'))" \
+        && find "." -maxdepth 1 -type d \
+        | (grep -E "/([dD]ebug|[rR]elease|[rR]eports)$" || true) \
+        | st_compatible_xargs_i_r "find \"{}\" -type f \
+          | (grep -iE '\.$suffix_regex$' || true)" \
+        | st_compatible_xargs_i_r "
+          src=\"{}\" \
+          && dest=\$(echo \"\$src\" | sed -E \"s/\\.$suffix_regex$/-$g_version-BUILD.$g_build_number.\\1/g\") \
+          && mv \"\$src\" \"\$dest\"
+        "
+      )
+
+      # recalculate sha256sum for artifact files
+      [ -d "." ] \
+        && rm -rf "./sha256sum.txt" \
+        && find "." -maxdepth 1 -type d \
+        | (grep -E "/([dD]ebug|[rR]elease|[rR]eports)$" || true) \
+        | st_compatible_xargs_i_r "find \"{}\" -type f \
+          | sed -E 's/^\.\///g'" \
+        | st_compatible_xargs_i_r 'sha256sum "{}" >> "./sha256sum.txt"'
+
+      st_build_save_incremental_build_number ".ci-tmp/build-numbers"
+  artifacts:
+    paths:
+      - '[dD]ebug/'
+      - '[rR]elease/'
+      - '[rR]eports/'
+      - '*repo-info.txt'
+      - '*head-manifest.xml'
+      - '*sha256sum.txt'
+      - __args__
+    when: always
+  cache:
+    key: $CI_PROJECT_PATH_SLUG
+    paths:
+      - .ci-cache
+  rules:
+    - if: $PCI_VARIANT == "stalco" && $CI_PIPELINE_SOURCE =~ /(web|schedule)/
